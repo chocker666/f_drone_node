@@ -15,10 +15,30 @@ find_package(sensor_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
+find_package(rclcpp_action REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  # Existing interfaces
   "msg/VehicleState.msg"
   "msg/TrajectorySetpoint.msg"
+
+  # Motion goal messages
+  "msg/MotionTarget.msg"
+  "msg/MotionReference.msg"
+  "msg/MotionPrimitive.msg"
+
+  # Primitive parameter envelopes
+  "msg/StraightParams.msg"
+  "msg/CurveParams.msg"
+  "msg/ForceParams.msg"
+
+  # Controller configuration
+  "msg/PIDParams.msg"
+  "msg/ControllerConfig.msg"
+
+  # Action interface
+  "action/ExecuteMotion.action"
+
   DEPENDENCIES
     builtin_interfaces
     geometry_msgs
