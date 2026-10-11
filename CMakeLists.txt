@@ -24,9 +24,16 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     geometry_msgs
 )
 
-# main exec
-add_executable(drone_node_exec
-  src/main.cpp
+# # main exec
+# add_executable(drone_node_exec
+#   src/main.cpp
+#   src/px4_interface.cpp
+#   src/frame_transforms.cpp
+# )
+
+# px4_interface exec
+add_executable(px4_interface_exec
+  src/px4_interface_main.cpp
   src/px4_interface.cpp
   src/frame_transforms.cpp
 )
@@ -34,22 +41,37 @@ add_executable(drone_node_exec
 rosidl_get_typesupport_target(cpp_typesupport_target
   ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
-target_link_libraries(drone_node_exec
+target_link_libraries(px4_interface_exec
   Eigen3::Eigen
   "${cpp_typesupport_target}"
 )
 
-target_include_directories(drone_node_exec PUBLIC
+target_include_directories(px4_interface_exec PUBLIC
   include
 )
 
-ament_target_dependencies(drone_node_exec
+ament_target_dependencies(px4_interface_exec
   rclcpp
   px4_msgs
   std_msgs
   geometry_msgs
   sensor_msgs
 )
+
+# flight_controller exec
+add_executable(flight_controller_exec
+  src/flight_controller_main.cpp
+  src/flight_controller.cpp
+)
+
+target_include_directories(flight_controller_exec PUBLIC
+  include
+)
+
+ament_target_dependencies(flight_controller_exec
+  rclcpp
+)
+
 
 # attitude tf test exec
 add_executable(attitude_test
@@ -76,8 +98,14 @@ target_link_libraries(attitude_test
 
 
 
+# install(TARGETS
+#   drone_node_exec
+#   attitude_test
+#   DESTINATION lib/${PROJECT_NAME}
+# )
 install(TARGETS
-  drone_node_exec
+  px4_interface_exec
+  flight_controller_exec
   attitude_test
   DESTINATION lib/${PROJECT_NAME}
 )
