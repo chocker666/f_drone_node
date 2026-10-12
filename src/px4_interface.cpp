@@ -447,16 +447,32 @@ void PX4Interface::publish_vehicle_command(
 
 //  GET arm/disarm command from higher layer
 void PX4Interface::arm_command_callback(
-  const std_msgs::msg::Bool::SharedPtr msg)
+    const std_msgs::msg::Bool::SharedPtr msg)
 {
-  const float arm_value = msg->data ? 1.0f : 0.0f;
+    if (msg->data) {
+        // 1. 请求进入 Offboard 模式
+        publish_vehicle_command(
+            px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE,
+            1.0f,
+            6.0f);
 
-  publish_vehicle_command(
-    px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM,
-    arm_value);
+        // 2. 请求解锁
+        publish_vehicle_command(
+            px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM,
+            1.0f);
 
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Vehicle %s command sent",
-    msg->data ? "ARM" : "DISARM");
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Offboard mode and ARM requested");
+    }
+    else {
+        // 请求上锁
+        publish_vehicle_command(
+            px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM,
+            0.0f);
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "DISARM requested");
+    }
 }
