@@ -27,7 +27,18 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     geometry_msgs
 )
 
+# Control algorithms
+add_library(drone_control_algorithms STATIC
+  src/algorithm/pid_controller.cpp
+)
 
+target_include_directories(drone_control_algorithms PUBLIC
+  include
+)
+
+target_link_libraries(drone_control_algorithms PUBLIC
+  Eigen3::Eigen
+)
 
 
 
@@ -66,6 +77,7 @@ add_executable(flight_controller_exec
 )
 
 target_link_libraries(flight_controller_exec
+  drone_control_algorithms
   "${cpp_typesupport_target}"
 )
 
@@ -120,6 +132,7 @@ ament_target_dependencies(drone_node_exec
 )
 
 target_link_libraries(drone_node_exec
+  drone_control_algorithms
   Eigen3::Eigen
   Threads::Threads
   "${cpp_typesupport_target}"
