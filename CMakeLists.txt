@@ -15,6 +15,9 @@ find_package(sensor_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
+find_package(Threads REQUIRED)
+
+
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/VehicleState.msg"
@@ -23,6 +26,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     builtin_interfaces
     geometry_msgs
 )
+
+
+
 
 
 # px4_interface exec
@@ -93,17 +99,38 @@ target_link_libraries(attitude_test
 )
 
 
+# drone_node exec
+add_executable(drone_node_exec
+  src/main.cpp
+  src/px4_interface.cpp
+  src/flight_controller.cpp
+  src/frame_transforms.cpp
+)
+
+target_include_directories(drone_node_exec PUBLIC
+  include
+)
+
+ament_target_dependencies(drone_node_exec
+  rclcpp
+  px4_msgs
+  std_msgs
+  geometry_msgs
+  sensor_msgs
+)
+
+target_link_libraries(drone_node_exec
+  Eigen3::Eigen
+  Threads::Threads
+  "${cpp_typesupport_target}"
+)
 
 
 
 
 
-# install(TARGETS
-#   drone_node_exec
-#   attitude_test
-#   DESTINATION lib/${PROJECT_NAME}
-# )
 install(TARGETS
+  drone_node_exec
   px4_interface_exec
   flight_controller_exec
   attitude_test

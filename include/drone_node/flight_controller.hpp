@@ -12,7 +12,9 @@
 class FlightController : public rclcpp::Node
 {
 public:
-    FlightController();
+    // FlightController();
+    explicit FlightController(
+    const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
 
 private:
     using VehicleState = drone_node::msg::VehicleState;

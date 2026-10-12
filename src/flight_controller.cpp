@@ -5,8 +5,10 @@
 #include <functional>
 #include <stdexcept>
 
-FlightController::FlightController()
-    : Node("flight_controller")
+// FlightController::FlightController() : Node("flight_controller")
+FlightController::FlightController(
+    const rclcpp::NodeOptions & options)
+    : Node("flight_controller", options)
 {
     control_frequency_ = this->declare_parameter<double>(
         "control_frequency", 50.0);
@@ -65,6 +67,11 @@ FlightController::FlightController()
 void FlightController::vehicle_state_callback(
     const VehicleState::SharedPtr msg)
 {
+    // RCLCPP_INFO(
+    // this->get_logger(),
+    // "SUB address: %p",
+    // static_cast<const void *>(msg.get()));
+
     const auto &p = msg->position;
     const auto &v = msg->velocity;
     const auto &q = msg->orientation;

@@ -8,7 +8,10 @@
 namespace ft = drone_node::frame_transforms;
 
 
-PX4Interface::PX4Interface() : Node("px4_interface")
+// PX4Interface::PX4Interface() : Node("px4_interface")
+PX4Interface::PX4Interface(
+    const rclcpp::NodeOptions & options)
+    : Node("px4_interface", options)
 {
     RCLCPP_INFO(this->get_logger(), "PX4 interface started");
     
@@ -154,6 +157,28 @@ void PX4Interface::vehicle_local_position_callback(
     position_enu_ = ft::ned_to_enu_local_frame(position_ned);
     velocity_enu_ = ft::ned_to_enu_local_frame(velocity_ned);
     
+    // auto state = std::make_unique<drone_node::msg::VehicleState>();
+    // state->stamp = this->now();
+
+    // state->position.x = position_enu_.x();
+    // state->position.y = position_enu_.y();
+    // state->position.z = position_enu_.z();
+
+    // state->velocity.x = velocity_enu_.x();
+    // state->velocity.y = velocity_enu_.y();
+    // state->velocity.z = velocity_enu_.z();
+
+    // state->orientation.x = attitude_enu_flu_.x();
+    // state->orientation.y = attitude_enu_flu_.y();
+    // state->orientation.z = attitude_enu_flu_.z();
+    // state->orientation.w = attitude_enu_flu_.w();
+
+    // RCLCPP_INFO(
+    //     this->get_logger(),
+    //     "PUB address: %p",
+    //     static_cast<const void *>(state.get()));
+
+    // vehicle_state_pub_->publish(std::move(state));
     drone_node::msg::VehicleState state;
     state.stamp = this->now();
 
@@ -172,7 +197,7 @@ void PX4Interface::vehicle_local_position_callback(
     state.orientation.y = attitude_enu_flu_.y();
     state.orientation.z = attitude_enu_flu_.z();
     state.orientation.w = attitude_enu_flu_.w();
-        
+
     vehicle_state_pub_->publish(state);
 }
 

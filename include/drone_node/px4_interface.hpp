@@ -32,7 +32,9 @@ enum class ControlMode : uint8_t
 class PX4Interface : public rclcpp::Node
 {
 public:
-    PX4Interface();
+    // PX4Interface();
+    explicit PX4Interface(
+    const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
     
 private:
     //  configs
