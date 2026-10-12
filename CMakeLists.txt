@@ -24,12 +24,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     geometry_msgs
 )
 
-# # main exec
-# add_executable(drone_node_exec
-#   src/main.cpp
-#   src/px4_interface.cpp
-#   src/frame_transforms.cpp
-# )
 
 # px4_interface exec
 add_executable(px4_interface_exec
@@ -58,10 +52,15 @@ ament_target_dependencies(px4_interface_exec
   sensor_msgs
 )
 
+
 # flight_controller exec
 add_executable(flight_controller_exec
   src/flight_controller_main.cpp
   src/flight_controller.cpp
+)
+
+target_link_libraries(flight_controller_exec
+  "${cpp_typesupport_target}"
 )
 
 target_include_directories(flight_controller_exec PUBLIC
@@ -70,6 +69,7 @@ target_include_directories(flight_controller_exec PUBLIC
 
 ament_target_dependencies(flight_controller_exec
   rclcpp
+  geometry_msgs
 )
 
 
