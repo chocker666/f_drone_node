@@ -27,26 +27,34 @@ Eigen::Vector3d limit_norm(
 }  // namespace
 
 PIDController::PIDController(
-    const PIDParameters & parameters)
-    : parameters_(parameters)
+    const PIDParameters& parameters)
 {
-    const auto valid_nonnegative = [](double value) {
+    set_parameters(parameters);
+}
+
+void PIDController::set_parameters(
+    const PIDParameters& parameters)
+{
+    const auto nonnegative = [](double value) {
         return std::isfinite(value) && value >= 0.0;
     };
 
-    const auto valid_positive = [](double value) {
+    const auto positive = [](double value) {
         return std::isfinite(value) && value > 0.0;
     };
 
-    if (!valid_nonnegative(parameters_.kp) ||
-        !valid_nonnegative(parameters_.ki) ||
-        !valid_nonnegative(parameters_.kd) ||
-        !valid_positive(parameters_.max_speed) ||
-        !valid_positive(parameters_.max_acceleration) ||
-        !valid_positive(parameters_.integral_limit)) {
+    if (!nonnegative(parameters.kp) ||
+        !nonnegative(parameters.ki) ||
+        !nonnegative(parameters.kd) ||
+        !positive(parameters.max_speed) ||
+        !positive(parameters.max_acceleration) ||
+        !positive(parameters.integral_limit)) {
         throw std::invalid_argument(
             "Invalid PID controller parameters");
     }
+
+    parameters_ = parameters;
+    reset();
 }
 
 void PIDController::reset()

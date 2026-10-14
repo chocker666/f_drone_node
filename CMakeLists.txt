@@ -19,9 +19,17 @@ find_package(Threads REQUIRED)
 
 
 
+
 rosidl_generate_interfaces(${PROJECT_NAME}
+  # inter part msg
   "msg/VehicleState.msg"
   "msg/TrajectorySetpoint.msg"
+  # ctrl part msg
+  "msg/ControlTrajectory.msg"
+  "msg/FixedTrajectory.msg"
+  "msg/PIDParams.msg"
+  "msg/ControlStatus.msg"
+  # others
   DEPENDENCIES
     builtin_interfaces
     geometry_msgs
@@ -71,9 +79,18 @@ ament_target_dependencies(px4_interface_exec
 
 
 # flight_controller exec
+# add_executable(flight_controller_exec
+#   src/flight_controller_main.cpp
+#   src/flight_controller.cpp
+#   src/algorithm/pid_controller.cpp
+#   src/trajectory_sampler/fixed_sampler.cpp
+#   src/trajectory_manager.cpp
+# )
 add_executable(flight_controller_exec
   src/flight_controller_main.cpp
   src/flight_controller.cpp
+  src/trajectory_manager.cpp
+  src/trajectory_sampler/fixed_sampler.cpp
 )
 
 target_link_libraries(flight_controller_exec
@@ -88,6 +105,46 @@ target_include_directories(flight_controller_exec PUBLIC
 ament_target_dependencies(flight_controller_exec
   rclcpp
   geometry_msgs
+)
+
+
+
+# drone_node exec
+# add_executable(drone_node_exec
+#   src/main.cpp
+#   src/px4_interface.cpp
+#   src/flight_controller.cpp
+#   src/frame_transforms.cpp
+#   src/algorithm/pid_controller.cpp
+#   src/trajectory_sampler/fixed_sampler.cpp
+#   src/trajectory_manager.cpp
+# )
+add_executable(drone_node_exec
+  src/main.cpp
+  src/px4_interface.cpp
+  src/flight_controller.cpp
+  src/trajectory_manager.cpp
+  src/trajectory_sampler/fixed_sampler.cpp
+  src/frame_transforms.cpp
+)
+
+target_include_directories(drone_node_exec PUBLIC
+  include
+)
+
+ament_target_dependencies(drone_node_exec
+  rclcpp
+  px4_msgs
+  std_msgs
+  geometry_msgs
+  sensor_msgs
+)
+
+target_link_libraries(drone_node_exec
+  drone_control_algorithms
+  Eigen3::Eigen
+  Threads::Threads
+  "${cpp_typesupport_target}"
 )
 
 
@@ -111,32 +168,8 @@ target_link_libraries(attitude_test
 )
 
 
-# drone_node exec
-add_executable(drone_node_exec
-  src/main.cpp
-  src/px4_interface.cpp
-  src/flight_controller.cpp
-  src/frame_transforms.cpp
-)
 
-target_include_directories(drone_node_exec PUBLIC
-  include
-)
 
-ament_target_dependencies(drone_node_exec
-  rclcpp
-  px4_msgs
-  std_msgs
-  geometry_msgs
-  sensor_msgs
-)
-
-target_link_libraries(drone_node_exec
-  drone_control_algorithms
-  Eigen3::Eigen
-  Threads::Threads
-  "${cpp_typesupport_target}"
-)
 
 
 

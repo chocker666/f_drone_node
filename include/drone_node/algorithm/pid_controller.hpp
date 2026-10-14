@@ -22,10 +22,14 @@ class PIDController final : public ControllerBase
 public:
     explicit PIDController(const PIDParameters & parameters);
 
+    void set_parameters(
+        const PIDParameters& parameters);
+
     void reset() override;
 
     ControllerOutput update(
         const ControllerInput & input) override;
+
 
 private:
     PIDParameters parameters_;
