@@ -1,0 +1,21 @@
+
+px4_interface:
+  ros__parameters:
+    vehicle_status_topic: "/fmu/out/vehicle_status_v1"
+    heartbeat_timeout: 1.0
+    status_publish_rate: 10.0
+
+    vehicle_command_topic: "/fmu/in/vehicle_command"
+    vehicle_local_position_topic: "/fmu/out/vehicle_local_position_v1"
+    vehicle_attitude_topic: "/fmu/out/vehicle_attitude"
+
+    offboard_mode_publish_rate: 20.0
+    px4_trajectory_setpoint_topic: "/fmu/in/trajectory_setpoint"
+    offboard_control_mode_topic: "/fmu/in/offboard_control_mode"
+
+flight_controller:
+  ros__parameters:
+    enable_setpoint_stream: true
+    control_frequency: 50.0
+    status_frequency: 10.0
+    state_timeout: 0.5
