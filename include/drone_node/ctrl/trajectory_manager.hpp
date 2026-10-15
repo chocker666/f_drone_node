@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <cstdint>
@@ -30,8 +29,6 @@ public:
         REJECTED
     };
 
-    // Strong guarantee: invalid trajectories do not replace
-    // the currently active trajectory.
     AcceptResult accept(
         const ControlTrajectory& msg,
         const rclcpp::Time& now,
@@ -47,16 +44,24 @@ public:
 
     uint64_t trajectory_id() const noexcept;
 
-    const PIDParameters& pid_parameters() const;
+    const PIDParameters& position_pid_parameters() const;
+    const PIDParameters& yaw_pid_parameters() const;
+
+    uint8_t yaw_direction() const noexcept;
 
     void clear() noexcept;
 
 private:
     std::unique_ptr<SamplerBase> sampler_;
 
-    PIDParameters pid_parameters_{};
+    PIDParameters position_pid_parameters_{};
+    PIDParameters yaw_pid_parameters_{};
+
+    uint8_t yaw_direction_{
+        drone_node::msg::FixedTrajectory::SHORTEST};
 
     uint64_t trajectory_id_{0};
+    uint64_t last_accepted_id_{0};
 
     rclcpp::Time start_time_{0, 0, RCL_ROS_TIME};
 

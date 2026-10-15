@@ -1,6 +1,4 @@
-
 #include "drone_node/ctrl/flight_controller.hpp"
-#include "drone_node/ctrl/algorithm/pid_controller.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +8,17 @@
 using drone_node::algorithm::PIDParameters;
 using PositionPID = drone_node::algorithm::PIDController<3>;
 using PositionInput = drone_node::algorithm::ControllerInput<3>;
+using YawInput = drone_node::algorithm::ControllerInput<1>;
+
+namespace
+{
+
+constexpr double PI = 3.14159265358979323846;
+constexpr double TWO_PI = 2.0 * PI;
+constexpr double RAD_TO_DEG = 180.0 / PI;
+constexpr double ANGLE_EPS = 1e-10;
+
+}
 
 FlightController::FlightController(
     const rclcpp::NodeOptions& options)
@@ -42,13 +51,8 @@ FlightController::FlightController(
             "Invalid FlightController parameters");
     }
 
-    // Default PID parameters are only used for
-    // initial controller construction.
-    // Each accepted trajectory supplies its own gains.
-    PIDParameters defaults;
-
     controller_ =
-        std::make_unique<PositionPID>(defaults);
+        std::make_unique<PositionPID>(PIDParameters{});
 
     vehicle_state_sub_ =
         create_subscription<VehicleState>(
@@ -110,6 +114,156 @@ FlightController::FlightController(
             "enabled" : "disabled");
 }
 
+double FlightController::wrap_pi(double angle)
+{
+    // (-pi, pi], with +pi selected at the tie.
+    double result = std::remainder(angle, TWO_PI);
+
+    if (result <= -PI) {
+        result += TWO_PI;
+    }
+
+    return result;
+}
+
+double FlightController::yaw_from_quaternion(
+    const geometry_msgs::msg::Quaternion& q)
+{
+    const double norm_squared =
+        q.w * q.w + q.x * q.x +
+        q.y * q.y + q.z * q.z;
+
+    const double siny =
+        2.0 * (q.w * q.z + q.x * q.y) /
+        norm_squared;
+
+    const double cosy =
+        1.0 -
+        2.0 * (q.y * q.y + q.z * q.z) /
+        norm_squared;
+
+    return std::atan2(siny, cosy);
+}
+
+double FlightController::select_yaw_delta(
+    double current_yaw,
+    double target_yaw,
+    uint8_t direction)
+{
+    double delta =
+        wrap_pi(target_yaw - current_yaw);
+
+    if (std::abs(std::abs(delta) - PI) < ANGLE_EPS) {
+        delta = PI;
+    }
+
+    using FixedTrajectory =
+        drone_node::msg::FixedTrajectory;
+
+    switch (direction) {
+    case FixedTrajectory::SHORTEST:
+        break;
+
+    case FixedTrajectory::CW:
+        if (delta > 0.0) {
+            delta -= TWO_PI;
+        }
+        break;
+
+    case FixedTrajectory::CCW:
+        if (delta < 0.0) {
+            delta += TWO_PI;
+        }
+        break;
+
+    default:
+        throw std::invalid_argument(
+            "Invalid yaw direction");
+    }
+
+    return delta;
+}
+
+void FlightController::update_unwrapped_yaw(
+    double measured_yaw)
+{
+    const auto receive_time = SteadyClock::now();
+
+    if (!has_yaw_measurement_) {
+        previous_wrapped_yaw_ = measured_yaw;
+        unwrapped_yaw_ = measured_yaw;
+        measured_yaw_rate_ = 0.0;
+        last_yaw_receive_time_ = receive_time;
+        has_yaw_measurement_ = true;
+        return;
+    }
+
+    const double dt =
+        std::chrono::duration<double>(
+            receive_time -
+            last_yaw_receive_time_).count();
+
+    if (dt <= 0.0) {
+        return;
+    }
+
+    const double delta =
+        wrap_pi(measured_yaw - previous_wrapped_yaw_);
+
+    // Feedback interruption invalidates continuous yaw.
+    // Reinitializing during an active CW/CCW trajectory
+    // could silently change its requested turn.
+    if (dt > state_timeout_ ||
+        std::abs(delta) >= PI - ANGLE_EPS) {
+        has_yaw_measurement_ = false;
+        measured_yaw_rate_ = 0.0;
+
+        if (trajectory_manager_.has_trajectory()) {
+            enter_fault(
+                ControlStatus::FAULT_INVALID_STATE);
+        }
+        return;
+    }
+
+    unwrapped_yaw_ += delta;
+
+    measured_yaw_rate_ = delta / dt;
+
+    previous_wrapped_yaw_ = measured_yaw;
+    last_yaw_receive_time_ = receive_time;
+}
+
+void FlightController::initialize_yaw_reference(
+    double target_yaw)
+{
+    if (!has_yaw_measurement_) {
+        throw std::runtime_error(
+            "Yaw measurement unavailable");
+    }
+
+    const double delta = select_yaw_delta(
+        unwrapped_yaw_,
+        target_yaw,
+        trajectory_manager_.yaw_direction());
+
+    target_unwrapped_yaw_ =
+        unwrapped_yaw_ + delta;
+
+    yaw_controller_.reset();
+    yaw_reference_initialized_ = true;
+
+    RCLCPP_INFO(
+        get_logger(),
+        "Yaw target: current=%.2f deg, "
+        "target=%.2f deg, delta=%.2f deg, "
+        "direction=%u",
+        unwrapped_yaw_ * RAD_TO_DEG,
+        target_unwrapped_yaw_ * RAD_TO_DEG,
+        delta * RAD_TO_DEG,
+        static_cast<unsigned int>(
+            trajectory_manager_.yaw_direction()));
+}
+
 void FlightController::vehicle_state_callback(
     const VehicleState::SharedPtr msg)
 {
@@ -147,11 +301,14 @@ void FlightController::vehicle_state_callback(
     latest_vehicle_state_ = *msg;
     has_valid_state_ = true;
     last_state_receive_time_ = SteadyClock::now();
+
+    const double yaw = yaw_from_quaternion(q);
+    update_unwrapped_yaw(yaw);
 }
 
 bool FlightController::state_is_fresh() const
 {
-    if (!has_valid_state_) {
+    if (!has_valid_state_ || !has_yaw_measurement_) {
         return false;
     }
 
@@ -182,8 +339,8 @@ void FlightController::trajectory_callback(
 
     std::string reason;
 
-    const auto result = trajectory_manager_.accept(
-        *msg, now(), reason);
+    const auto result =
+        trajectory_manager_.accept(*msg, now(), reason);
 
     if (result ==
         drone_node::TrajectoryManager::AcceptResult::REJECTED) {
@@ -198,48 +355,50 @@ void FlightController::trajectory_callback(
 
     if (result ==
         drone_node::TrajectoryManager::AcceptResult::DUPLICATE) {
-        RCLCPP_DEBUG(
-            get_logger(),
-            "Duplicate trajectory %lu ignored",
-            static_cast<unsigned long>(
-                msg->trajectory_id));
         return;
     }
 
-    // Apply the parameters of the accepted trajectory.
-    // The PID implementation and its mathematical
-    // update rule remain unchanged.
-    auto* pid =
-        dynamic_cast<PositionPID*>(controller_.get());
+    try {
+        auto* position_pid =
+            dynamic_cast<PositionPID*>(controller_.get());
 
-    if (!pid) {
+        if (!position_pid) {
+            throw std::runtime_error(
+                "Position PID unavailable");
+        }
+
+        position_pid->set_parameters(
+            trajectory_manager_.position_pid_parameters());
+
+        yaw_controller_.set_parameters(
+            trajectory_manager_.yaw_pid_parameters());
+
+        yaw_reference_initialized_ = false;
+        has_last_control_time_ = false;
+        has_reference_ = false;
+
+        fault_code_ = ControlStatus::FAULT_NONE;
+
+        change_control_state(
+            trajectory_manager_.is_started(now()) ?
+                ControlStatus::TRACKING :
+                ControlStatus::WAITING);
+
+        RCLCPP_INFO(
+            get_logger(),
+            "Trajectory %lu accepted",
+            static_cast<unsigned long>(
+                trajectory_manager_.trajectory_id()));
+
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(
+            get_logger(),
+            "Controller configuration failed: %s",
+            e.what());
+
         enter_fault(
             ControlStatus::FAULT_CONTROLLER_ERROR);
-        return;
     }
-
-    pid->set_parameters(
-        trajectory_manager_.pid_parameters());
-
-    has_last_control_time_ = false;
-    has_reference_ = false;
-
-    fault_code_ = ControlStatus::FAULT_NONE;
-
-    change_control_state(
-        trajectory_manager_.is_started(now()) ?
-            ControlStatus::TRACKING :
-            ControlStatus::WAITING);
-
-    RCLCPP_INFO(
-        get_logger(),
-        "Trajectory %lu accepted, PID "
-        "kp=%.3f ki=%.3f kd=%.3f",
-        static_cast<unsigned long>(
-            trajectory_manager_.trajectory_id()),
-        trajectory_manager_.pid_parameters().kp,
-        trajectory_manager_.pid_parameters().ki,
-        trajectory_manager_.pid_parameters().kd);
 }
 
 void FlightController::change_control_state(
@@ -263,8 +422,11 @@ void FlightController::enter_fault(
     fault_code_ = fault_code;
 
     trajectory_manager_.clear();
-    controller_->reset();
 
+    controller_->reset();
+    yaw_controller_.reset();
+
+    yaw_reference_initialized_ = false;
     has_reference_ = false;
     has_last_control_time_ = false;
 
@@ -277,7 +439,8 @@ void FlightController::enter_fault(
 }
 
 void FlightController::publish_velocity_setpoint(
-    const Eigen::Vector3d& velocity)
+    const Eigen::Vector3d& velocity,
+    double yaw_rate)
 {
     TrajectorySetpoint setpoint{};
 
@@ -288,8 +451,9 @@ void FlightController::publish_velocity_setpoint(
     setpoint.velocity.y = velocity.y();
     setpoint.velocity.z = velocity.z();
 
-    // Keep existing behavior: no yaw-rate control.
-    setpoint.yawspeed = 0.0f;
+    // Internal rad/s -> message deg/s.
+    setpoint.yawspeed =
+        static_cast<float>(yaw_rate * RAD_TO_DEG);
 
     trajectory_setpoint_pub_->publish(setpoint);
 }
@@ -339,10 +503,13 @@ void FlightController::control_loop()
 
         has_reference_ = true;
 
+        if (!yaw_reference_initialized_) {
+            initialize_yaw_reference(
+                latest_reference_.yaw);
+        }
+
         const auto& p = latest_vehicle_state_.position;
         const auto& v = latest_vehicle_state_.velocity;
-
-        PositionInput input;
 
         const Eigen::Vector3d current_position(
             p.x, p.y, p.z);
@@ -350,26 +517,45 @@ void FlightController::control_loop()
         const Eigen::Vector3d current_velocity(
             v.x, v.y, v.z);
 
-        // Position error in ENU, m.
-        input.error =
+        // Position PID: m -> m/s.
+        PositionInput position_input;
+
+        position_input.error =
             latest_reference_.position - current_position;
 
-        // Error derivative for a fixed-position reference.
-        // For a moving reference, this should become
-        // reference_velocity - current_velocity.
-        input.error_rate = -current_velocity;
+        position_input.error_rate =
+            latest_reference_.velocity - current_velocity;
 
-        input.dt = dt;
+        position_input.dt = dt;
 
-        const auto output =
-            controller_->update(input);
+        const auto position_output =
+            controller_->update(position_input);
 
-        if (!output.command.allFinite()) {
+        // Yaw PID: rad -> rad/s.
+        YawInput yaw_input;
+
+        // Do not wrap this error.
+        yaw_input.error(0) =
+            target_unwrapped_yaw_ - unwrapped_yaw_;
+
+        yaw_input.error_rate(0) =
+            latest_reference_.yaw_rate -
+            measured_yaw_rate_;
+
+        yaw_input.dt = dt;
+
+        const auto yaw_output =
+            yaw_controller_.update(yaw_input);
+
+        if (!position_output.command.allFinite() ||
+            !yaw_output.command.allFinite()) {
             throw std::runtime_error(
                 "Non-finite controller output");
         }
 
-        publish_velocity_setpoint(output.command);
+        publish_velocity_setpoint(
+            position_output.command,
+            yaw_output.command(0));
 
     } catch (const std::exception& e) {
         RCLCPP_ERROR(

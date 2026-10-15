@@ -1,4 +1,3 @@
-
 #include "drone_node/ctrl/trajectory_manager.hpp"
 
 #include <cmath>
@@ -9,6 +8,47 @@
 
 namespace drone_node
 {
+
+namespace
+{
+
+bool valid_pid(const algorithm::PIDParameters& p)
+{
+    const auto nonnegative = [](double x) {
+        return std::isfinite(x) && x >= 0.0;
+    };
+
+    const auto positive = [](double x) {
+        return std::isfinite(x) && x > 0.0;
+    };
+
+    return nonnegative(p.kp) &&
+           nonnegative(p.ki) &&
+           nonnegative(p.kd) &&
+           positive(p.max_output) &&
+           positive(p.max_output_rate) &&
+           positive(p.integral_limit);
+}
+
+algorithm::PIDParameters make_pid_parameters(
+    const msg::PIDParams& source,
+    algorithm::PIDLimitMode limit_mode)
+{
+    algorithm::PIDParameters result;
+
+    result.kp = source.kp;
+    result.ki = source.ki;
+    result.kd = source.kd;
+
+    result.max_output = source.max_output;
+    result.max_output_rate = source.max_output_rate;
+    result.integral_limit = source.integral_limit;
+    result.limit_mode = limit_mode;
+
+    return result;
+}
+
+}  // namespace
 
 TrajectoryManager::AcceptResult TrajectoryManager::accept(
     const ControlTrajectory& msg,
@@ -22,14 +62,13 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
         return AcceptResult::REJECTED;
     }
 
-    if (has_trajectory_ &&
-        msg.trajectory_id == trajectory_id_) {
+    if (msg.trajectory_id == last_accepted_id_ &&
+        last_accepted_id_ != 0) {
         reason = "duplicate trajectory_id";
         return AcceptResult::DUPLICATE;
     }
 
-    if (has_trajectory_ &&
-        msg.trajectory_id < trajectory_id_) {
+    if (msg.trajectory_id < last_accepted_id_) {
         reason = "outdated trajectory_id";
         return AcceptResult::REJECTED;
     }
@@ -49,43 +88,39 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
         return AcceptResult::REJECTED;
     }
 
-    PIDParameters params;
-    params.kp = msg.pid_params.kp;
-    params.ki = msg.pid_params.ki;
-    params.kd = msg.pid_params.kd;
-    params.max_output = msg.pid_params.max_speed;
-    params.max_output_rate =
-        msg.pid_params.max_acceleration;
-    params.limit_mode =
-        drone_node::algorithm::PIDLimitMode::NORM;
-    params.integral_limit =
-        msg.pid_params.integral_limit;
+    const uint8_t direction =
+        msg.fixed_params.yaw_direction;
 
-    // Validate all parameters before replacing the
-    // active sampler.
-    const auto nonnegative = [](double x) {
-        return std::isfinite(x) && x >= 0.0;
-    };
+    using FixedTrajectory = drone_node::msg::FixedTrajectory;
 
-    const auto positive = [](double x) {
-        return std::isfinite(x) && x > 0.0;
-    };
+    if (direction != FixedTrajectory::SHORTEST &&
+        direction != FixedTrajectory::CW &&
+        direction != FixedTrajectory::CCW) {
+        reason = "invalid yaw_direction";
+        return AcceptResult::REJECTED;
+    }
 
-    if (!nonnegative(params.kp) ||
-        !nonnegative(params.ki) ||
-        !nonnegative(params.kd) ||
-        !positive(params.max_output) ||
-        !positive(params.max_output_rate) ||
-        !positive(params.integral_limit)) {
-        reason = "invalid PID parameters";
+    const auto position_params = make_pid_parameters(
+        msg.position_pid_params,
+        algorithm::PIDLimitMode::NORM);
+
+    const auto yaw_params = make_pid_parameters(
+        msg.yaw_pid_params,
+        algorithm::PIDLimitMode::PER_AXIS);
+
+    if (!valid_pid(position_params)) {
+        reason = "invalid position PID parameters";
+        return AcceptResult::REJECTED;
+    }
+
+    if (!valid_pid(yaw_params)) {
+        reason = "invalid yaw PID parameters";
         return AcceptResult::REJECTED;
     }
 
     rclcpp::Time new_start_time(
         msg.start_time, now.get_clock_type());
 
-    // Zero time means "start immediately".
-    // This is a deliberate convenience for manual testing.
     if (new_start_time.nanoseconds() == 0) {
         new_start_time = now;
     }
@@ -93,18 +128,25 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
     try {
         std::unique_ptr<SamplerBase> new_sampler =
             std::make_unique<
-                drone_node::trajectory_sampler::FixedSampler>(
+                trajectory_sampler::FixedSampler>(
                     msg.fixed_params);
 
-        // Commit only after validation and construction.
+        // Commit only after validation.
         sampler_ = std::move(new_sampler);
-        pid_parameters_ = params;
+
+        position_pid_parameters_ = position_params;
+        yaw_pid_parameters_ = yaw_params;
+        yaw_direction_ = direction;
+
         start_time_ = new_start_time;
         trajectory_id_ = msg.trajectory_id;
+        last_accepted_id_ = msg.trajectory_id;
+
         has_trajectory_ = true;
 
         reason = "accepted";
         return AcceptResult::ACCEPTED;
+
     } catch (const std::exception& e) {
         reason = e.what();
         return AcceptResult::REJECTED;
@@ -153,20 +195,34 @@ uint64_t TrajectoryManager::trajectory_id() const noexcept
 }
 
 const TrajectoryManager::PIDParameters&
-TrajectoryManager::pid_parameters() const
+TrajectoryManager::position_pid_parameters() const
 {
     if (!has_trajectory_) {
         throw std::logic_error("No active trajectory");
     }
 
-    return pid_parameters_;
+    return position_pid_parameters_;
+}
+
+const TrajectoryManager::PIDParameters&
+TrajectoryManager::yaw_pid_parameters() const
+{
+    if (!has_trajectory_) {
+        throw std::logic_error("No active trajectory");
+    }
+
+    return yaw_pid_parameters_;
+}
+
+uint8_t TrajectoryManager::yaw_direction() const noexcept
+{
+    return yaw_direction_;
 }
 
 void TrajectoryManager::clear() noexcept
 {
     sampler_.reset();
     has_trajectory_ = false;
-    // Retain the last ID for diagnostics.
 }
 
 }  // namespace drone_node

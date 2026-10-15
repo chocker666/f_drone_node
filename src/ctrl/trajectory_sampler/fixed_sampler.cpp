@@ -1,4 +1,3 @@
-
 #include "drone_node/ctrl/trajectory_sampler/fixed_sampler.hpp"
 
 #include <cmath>
@@ -27,6 +26,7 @@ FixedSampler::FixedSampler(
     reference_.velocity.setZero();
     reference_.acceleration.setZero();
 
+    // Both message and internal reference use radians.
     reference_.yaw = trajectory.yaw;
     reference_.yaw_rate = 0.0;
 }
