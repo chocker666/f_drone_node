@@ -5,7 +5,10 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# find dependencies
+# ============================================================
+# Dependencies
+# ============================================================
+
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(px4_msgs REQUIRED)
@@ -17,56 +20,85 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(Threads REQUIRED)
 
+# ============================================================
+# ROS2 interfaces
+# ============================================================
 
-
-
-rosidl_generate_interfaces(${PROJECT_NAME}
-  # inter part msg
+set(INTER_MSG_FILES
   "msg/VehicleState.msg"
   "msg/TrajectorySetpoint.msg"
-  # ctrl part msg
+)
+
+set(CTRL_MSG_FILES
   "msg/ControlTrajectory.msg"
   "msg/FixedTrajectory.msg"
   "msg/PIDParams.msg"
   "msg/ControlStatus.msg"
-  # others
+)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  ${INTER_MSG_FILES}
+  ${CTRL_MSG_FILES}
   DEPENDENCIES
     builtin_interfaces
     geometry_msgs
 )
 
+rosidl_get_typesupport_target(cpp_typesupport_target
+  ${PROJECT_NAME}
+  "rosidl_typesupport_cpp"
+)
+
+# ============================================================
+# Common include path
+# ============================================================
+
+set(DRONE_INCLUDE_DIR
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# ============================================================
 # Control algorithms
+# ============================================================
+
 add_library(drone_control_algorithms STATIC
-  src/algorithm/pid_controller.cpp
+  src/ctrl/algorithm/pid_controller.cpp
 )
 
 target_include_directories(drone_control_algorithms PUBLIC
-  include
+  ${DRONE_INCLUDE_DIR}
 )
 
 target_link_libraries(drone_control_algorithms PUBLIC
   Eigen3::Eigen
 )
 
+# ============================================================
+# Source groups
+# ============================================================
 
-
-# px4_interface exec
-add_executable(px4_interface_exec
-  src/px4_interface_main.cpp
-  src/px4_interface.cpp
-  src/frame_transforms.cpp
+set(INTER_SOURCES
+  src/inter/px4_interface.cpp
+  src/inter/frame_transforms.cpp
 )
 
-rosidl_get_typesupport_target(cpp_typesupport_target
-  ${PROJECT_NAME} "rosidl_typesupport_cpp")
+set(CTRL_SOURCES
+  src/ctrl/flight_controller.cpp
+  src/ctrl/trajectory_manager.cpp
+  src/ctrl/trajectory_sampler/fixed_sampler.cpp
+)
 
-target_link_libraries(px4_interface_exec
-  Eigen3::Eigen
-  "${cpp_typesupport_target}"
+# ============================================================
+# PX4 Interface executable
+# ============================================================
+
+add_executable(px4_interface_exec
+  src/main/inter_main.cpp
+  ${INTER_SOURCES}
 )
 
 target_include_directories(px4_interface_exec PUBLIC
-  include
+  ${DRONE_INCLUDE_DIR}
 )
 
 ament_target_dependencies(px4_interface_exec
@@ -77,29 +109,22 @@ ament_target_dependencies(px4_interface_exec
   sensor_msgs
 )
 
-
-# flight_controller exec
-# add_executable(flight_controller_exec
-#   src/flight_controller_main.cpp
-#   src/flight_controller.cpp
-#   src/algorithm/pid_controller.cpp
-#   src/trajectory_sampler/fixed_sampler.cpp
-#   src/trajectory_manager.cpp
-# )
-add_executable(flight_controller_exec
-  src/flight_controller_main.cpp
-  src/flight_controller.cpp
-  src/trajectory_manager.cpp
-  src/trajectory_sampler/fixed_sampler.cpp
-)
-
-target_link_libraries(flight_controller_exec
-  drone_control_algorithms
+target_link_libraries(px4_interface_exec
+  Eigen3::Eigen
   "${cpp_typesupport_target}"
 )
 
+# ============================================================
+# Flight Controller executable
+# ============================================================
+
+add_executable(flight_controller_exec
+  src/main/ctrl_main.cpp
+  ${CTRL_SOURCES}
+)
+
 target_include_directories(flight_controller_exec PUBLIC
-  include
+  ${DRONE_INCLUDE_DIR}
 )
 
 ament_target_dependencies(flight_controller_exec
@@ -107,29 +132,23 @@ ament_target_dependencies(flight_controller_exec
   geometry_msgs
 )
 
+target_link_libraries(flight_controller_exec
+  drone_control_algorithms
+  "${cpp_typesupport_target}"
+)
 
+# ============================================================
+# Combined Drone Node executable
+# ============================================================
 
-# drone_node exec
-# add_executable(drone_node_exec
-#   src/main.cpp
-#   src/px4_interface.cpp
-#   src/flight_controller.cpp
-#   src/frame_transforms.cpp
-#   src/algorithm/pid_controller.cpp
-#   src/trajectory_sampler/fixed_sampler.cpp
-#   src/trajectory_manager.cpp
-# )
 add_executable(drone_node_exec
-  src/main.cpp
-  src/px4_interface.cpp
-  src/flight_controller.cpp
-  src/trajectory_manager.cpp
-  src/trajectory_sampler/fixed_sampler.cpp
-  src/frame_transforms.cpp
+  src/main/drone_node_main.cpp
+  ${INTER_SOURCES}
+  ${CTRL_SOURCES}
 )
 
 target_include_directories(drone_node_exec PUBLIC
-  include
+  ${DRONE_INCLUDE_DIR}
 )
 
 ament_target_dependencies(drone_node_exec
@@ -147,14 +166,16 @@ target_link_libraries(drone_node_exec
   "${cpp_typesupport_target}"
 )
 
+# ============================================================
+# Attitude test executable
+# ============================================================
 
-# attitude tf test exec
 add_executable(attitude_test
-  src/attitude_test.cpp
+  test/inter/attitude_test.cpp
 )
 
 target_include_directories(attitude_test PUBLIC
-  include
+  ${DRONE_INCLUDE_DIR}
 )
 
 ament_target_dependencies(attitude_test
@@ -167,13 +188,9 @@ target_link_libraries(attitude_test
   "${cpp_typesupport_target}"
 )
 
-
-
-
-
-
-
-
+# ============================================================
+# Install
+# ============================================================
 
 install(TARGETS
   drone_node_exec
@@ -183,22 +200,26 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(DIRECTORY
-  config
-  DESTINATION share/${PROJECT_NAME}
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
+  install(DIRECTORY launch/
+    DESTINATION share/${PROJECT_NAME}/launch
+  )
+endif()
 
+# ============================================================
+# Testing and lint
+# ============================================================
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
+
   set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
+
   ament_lint_auto_find_test_dependencies()
 endif()
 

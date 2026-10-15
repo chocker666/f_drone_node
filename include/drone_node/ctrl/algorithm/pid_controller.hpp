@@ -1,7 +1,7 @@
 
 #pragma once
 
-#include "drone_node/algorithm/controller_base.hpp"
+#include "drone_node/ctrl/algorithm/controller_base.hpp"
 
 namespace drone_node::algorithm
 {

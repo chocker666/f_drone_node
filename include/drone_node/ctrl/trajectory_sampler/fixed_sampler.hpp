@@ -1,7 +1,7 @@
 
 #pragma once
 
-#include "drone_node/trajectory_sampler/trajectory_sampler_base.hpp"
+#include "drone_node/ctrl/trajectory_sampler/trajectory_sampler_base.hpp"
 #include "drone_node/msg/fixed_trajectory.hpp"
 
 namespace drone_node::trajectory_sampler

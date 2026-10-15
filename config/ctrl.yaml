@@ -1,0 +1,6 @@
+flight_controller:
+  ros__parameters:
+    enable_setpoint_stream: true
+    control_frequency: 50.0
+    status_frequency: 10.0
+    state_timeout: 0.5

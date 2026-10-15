@@ -1,6 +1,6 @@
 
-#include "drone_node/flight_controller.hpp"
-#include "drone_node/algorithm/pid_controller.hpp"
+#include "drone_node/ctrl/flight_controller.hpp"
+#include "drone_node/ctrl/algorithm/pid_controller.hpp"
 
 #include <algorithm>
 #include <cmath>

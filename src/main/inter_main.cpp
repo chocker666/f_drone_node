@@ -1,7 +1,7 @@
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
 
-#include "drone_node/px4_interface.hpp"
+#include "drone_node/inter/px4_interface.hpp"
 
 int main(int argc, char *argv[])
 {

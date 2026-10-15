@@ -5,8 +5,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
 
-#include "drone_node/px4_interface.hpp"
-#include "drone_node/flight_controller.hpp"
+#include "drone_node/inter/px4_interface.hpp"
+#include "drone_node/ctrl/flight_controller.hpp"
 
 int main(int argc, char *argv[])
 {

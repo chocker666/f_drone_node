@@ -40,7 +40,7 @@
  * Adapted from MAVROS ftf_frame_conversions.cpp and ftf_quaternion_utils.cpp.
  */
 
-#include <drone_node/frame_transforms.hpp>
+#include <drone_node/inter/frame_transforms.hpp>
 
 #include <assert.h>
 

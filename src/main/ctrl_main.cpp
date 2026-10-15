@@ -1,7 +1,7 @@
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
 
-#include "drone_node/flight_controller.hpp"
+#include "drone_node/ctrl/flight_controller.hpp"
 
 int main(int argc, char *argv[])
 {

@@ -1,11 +1,11 @@
 
-#include "drone_node/trajectory_manager.hpp"
+#include "drone_node/ctrl/trajectory_manager.hpp"
 
 #include <cmath>
 #include <stdexcept>
 #include <utility>
 
-#include "drone_node/trajectory_sampler/fixed_sampler.hpp"
+#include "drone_node/ctrl/trajectory_sampler/fixed_sampler.hpp"
 
 namespace drone_node
 {

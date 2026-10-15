@@ -13,8 +13,8 @@
 #include "drone_node/msg/control_trajectory.hpp"
 #include "drone_node/msg/control_status.hpp"
 
-#include "drone_node/algorithm/controller_base.hpp"
-#include "drone_node/trajectory_manager.hpp"
+#include "drone_node/ctrl/algorithm/controller_base.hpp"
+#include "drone_node/ctrl/trajectory_manager.hpp"
 #include "drone_node/types.hpp"
 
 class FlightController : public rclcpp::Node
