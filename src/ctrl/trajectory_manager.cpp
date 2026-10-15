@@ -53,9 +53,11 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
     params.kp = msg.pid_params.kp;
     params.ki = msg.pid_params.ki;
     params.kd = msg.pid_params.kd;
-    params.max_speed = msg.pid_params.max_speed;
-    params.max_acceleration =
+    params.max_output = msg.pid_params.max_speed;
+    params.max_output_rate =
         msg.pid_params.max_acceleration;
+    params.limit_mode =
+        drone_node::algorithm::PIDLimitMode::NORM;
     params.integral_limit =
         msg.pid_params.integral_limit;
 
@@ -72,8 +74,8 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
     if (!nonnegative(params.kp) ||
         !nonnegative(params.ki) ||
         !nonnegative(params.kd) ||
-        !positive(params.max_speed) ||
-        !positive(params.max_acceleration) ||
+        !positive(params.max_output) ||
+        !positive(params.max_output_rate) ||
         !positive(params.integral_limit)) {
         reason = "invalid PID parameters";
         return AcceptResult::REJECTED;

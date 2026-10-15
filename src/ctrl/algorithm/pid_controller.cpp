@@ -8,121 +8,151 @@
 namespace drone_node::algorithm
 {
 
-namespace
-{
-
-Eigen::Vector3d limit_norm(
-    const Eigen::Vector3d & vector,
-    double maximum_norm)
-{
-    const double norm = vector.norm();
-
-    if (norm <= maximum_norm || norm <= 0.0) {
-        return vector;
-    }
-
-    return vector * (maximum_norm / norm);
-}
-
-}  // namespace
-
-PIDController::PIDController(
+template<int N>
+PIDController<N>::PIDController(
     const PIDParameters& parameters)
 {
     set_parameters(parameters);
 }
 
-void PIDController::set_parameters(
+template<int N>
+void PIDController<N>::set_parameters(
     const PIDParameters& parameters)
 {
-    const auto nonnegative = [](double value) {
-        return std::isfinite(value) && value >= 0.0;
+    const auto nonnegative = [](double x) {
+        return std::isfinite(x) && x >= 0.0;
     };
 
-    const auto positive = [](double value) {
-        return std::isfinite(value) && value > 0.0;
+    const auto positive = [](double x) {
+        return std::isfinite(x) && x > 0.0;
     };
 
     if (!nonnegative(parameters.kp) ||
         !nonnegative(parameters.ki) ||
         !nonnegative(parameters.kd) ||
-        !positive(parameters.max_speed) ||
-        !positive(parameters.max_acceleration) ||
+        !positive(parameters.max_output) ||
+        !positive(parameters.max_output_rate) ||
         !positive(parameters.integral_limit)) {
         throw std::invalid_argument(
-            "Invalid PID controller parameters");
+            "Invalid PID parameters");
     }
 
     parameters_ = parameters;
     reset();
 }
 
-void PIDController::reset()
+template<int N>
+const PIDParameters&
+PIDController<N>::parameters() const noexcept
 {
-    integral_error_.setZero();
-    previous_velocity_command_.setZero();
+    return parameters_;
 }
 
-ControllerOutput PIDController::update(
-    const ControllerInput & input)
+template<int N>
+void PIDController<N>::reset()
+{
+    integral_error_.setZero();
+    previous_command_.setZero();
+}
+
+template<int N>
+typename PIDController<N>::Vector
+PIDController<N>::limit_vector(
+    const Vector& value,
+    double limit) const
+{
+    if (parameters_.limit_mode ==
+        PIDLimitMode::PER_AXIS) {
+        return value.cwiseMax(-limit).cwiseMin(limit);
+    }
+
+    const double norm = value.norm();
+
+    if (norm <= limit || norm <= 0.0) {
+        return value;
+    }
+
+    return value * (limit / norm);
+}
+
+template<int N>
+ControllerOutput<N> PIDController<N>::update(
+    const ControllerInput<N>& input)
 {
     if (!std::isfinite(input.dt) ||
         input.dt <= 0.0 ||
-        !input.position.allFinite() ||
-        !input.velocity.allFinite() ||
-        !input.target_position.allFinite()) {
+        !input.error.allFinite() ||
+        !input.error_rate.allFinite()) {
         throw std::invalid_argument(
-            "Invalid PID controller input");
+            "Invalid PID input");
     }
 
-    const Eigen::Vector3d error =
-        input.target_position - input.position;
+    const Vector previous_unsaturated =
+        parameters_.kp * input.error +
+        parameters_.ki * integral_error_ +
+        parameters_.kd * input.error_rate;
 
-    // Integrate position error with a norm limit.
-    // Freeze integration when the previous command
-    // was saturated in the direction of the error.
-    const Eigen::Vector3d previous_unsaturated =
-        parameters_.kp * error +
-        parameters_.ki * integral_error_ -
-        parameters_.kd * input.velocity;
+    // Conditional integration anti-windup.
+    bool saturated_outward = false;
 
-    const bool saturated_outward =
-        previous_unsaturated.norm() >
-            parameters_.max_speed &&
-        previous_unsaturated.dot(error) > 0.0;
+    if (parameters_.limit_mode ==
+        PIDLimitMode::NORM) {
+
+        saturated_outward =
+            previous_unsaturated.norm() >
+                parameters_.max_output &&
+            previous_unsaturated.dot(input.error) > 0.0;
+
+    } else {
+
+        for (int i = 0; i < N; ++i) {
+            if (std::abs(previous_unsaturated(i)) >
+                    parameters_.max_output &&
+                previous_unsaturated(i) *
+                    input.error(i) > 0.0) {
+                saturated_outward = true;
+                break;
+            }
+        }
+    }
 
     if (!saturated_outward) {
-        integral_error_ += error * input.dt;
-        integral_error_ = limit_norm(
+        integral_error_ += input.error * input.dt;
+
+        integral_error_ = limit_vector(
             integral_error_,
             parameters_.integral_limit);
     }
 
-    const Eigen::Vector3d raw_velocity =
-        parameters_.kp * error +
-        parameters_.ki * integral_error_ -
-        parameters_.kd * input.velocity;
+    const Vector raw_command =
+        parameters_.kp * input.error +
+        parameters_.ki * integral_error_ +
+        parameters_.kd * input.error_rate;
 
-    const Eigen::Vector3d limited_velocity =
-        limit_norm(raw_velocity, parameters_.max_speed);
+    const Vector limited_command = limit_vector(
+        raw_command,
+        parameters_.max_output);
 
-    // Rate-limit velocity setpoint changes.
-    const Eigen::Vector3d delta_velocity =
-        limited_velocity - previous_velocity_command_;
+    const Vector delta_command =
+        limited_command - previous_command_;
 
-    const Eigen::Vector3d limited_delta =
-        limit_norm(
-            delta_velocity,
-            parameters_.max_acceleration * input.dt);
+    const Vector limited_delta = limit_vector(
+        delta_command,
+        parameters_.max_output_rate * input.dt);
 
-    const Eigen::Vector3d velocity_command =
-        previous_velocity_command_ + limited_delta;
+    const Vector command =
+        previous_command_ + limited_delta;
 
-    previous_velocity_command_ = velocity_command;
+    previous_command_ = command;
 
-    ControllerOutput output;
-    output.velocity_setpoint = velocity_command;
+    ControllerOutput<N> output;
+    output.command = command;
     return output;
 }
+
+// Explicit template instantiations.
+template class PIDController<1>;
+template class PIDController<2>;
+template class PIDController<3>;
 
 }  // namespace drone_node::algorithm

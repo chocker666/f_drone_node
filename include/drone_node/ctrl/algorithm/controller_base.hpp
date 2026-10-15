@@ -6,28 +6,40 @@
 namespace drone_node::algorithm
 {
 
+template<int N>
+using ControlVector = Eigen::Matrix<double, N, 1>;
+
+template<int N>
 struct ControllerInput
 {
-    Eigen::Vector3d position{Eigen::Vector3d::Zero()};
-    Eigen::Vector3d velocity{Eigen::Vector3d::Zero()};
-    Eigen::Vector3d target_position{Eigen::Vector3d::Zero()};
+    ControlVector<N> error{
+        ControlVector<N>::Zero()};
+
+    ControlVector<N> error_rate{
+        ControlVector<N>::Zero()};
+
     double dt{0.02};
 };
 
+template<int N>
 struct ControllerOutput
 {
-    Eigen::Vector3d velocity_setpoint{Eigen::Vector3d::Zero()};
+    ControlVector<N> command{
+        ControlVector<N>::Zero()};
 };
 
+template<int N>
 class ControllerBase
 {
 public:
+    static_assert(N >= 1, "Control dimension must be positive");
+
     virtual ~ControllerBase() = default;
 
     virtual void reset() = 0;
 
-    virtual ControllerOutput update(
-        const ControllerInput & input) = 0;
+    virtual ControllerOutput<N> update(
+        const ControllerInput<N>& input) = 0;
 };
 
 }  // namespace drone_node::algorithm

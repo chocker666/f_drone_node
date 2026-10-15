@@ -61,7 +61,7 @@ private:
 
     // Controller and trajectory.
     std::unique_ptr<
-        drone_node::algorithm::ControllerBase> controller_;
+        drone_node::algorithm::ControllerBase<3>> controller_;
 
     drone_node::TrajectoryManager trajectory_manager_;
 

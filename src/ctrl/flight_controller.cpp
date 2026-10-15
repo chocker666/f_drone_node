@@ -7,9 +7,9 @@
 #include <functional>
 #include <stdexcept>
 
-using drone_node::algorithm::ControllerInput;
-using drone_node::algorithm::PIDController;
 using drone_node::algorithm::PIDParameters;
+using PositionPID = drone_node::algorithm::PIDController<3>;
+using PositionInput = drone_node::algorithm::ControllerInput<3>;
 
 FlightController::FlightController(
     const rclcpp::NodeOptions& options)
@@ -48,7 +48,7 @@ FlightController::FlightController(
     PIDParameters defaults;
 
     controller_ =
-        std::make_unique<PIDController>(defaults);
+        std::make_unique<PositionPID>(defaults);
 
     vehicle_state_sub_ =
         create_subscription<VehicleState>(
@@ -210,7 +210,7 @@ void FlightController::trajectory_callback(
     // The PID implementation and its mathematical
     // update rule remain unchanged.
     auto* pid =
-        dynamic_cast<PIDController*>(controller_.get());
+        dynamic_cast<PositionPID*>(controller_.get());
 
     if (!pid) {
         enter_fault(
@@ -342,29 +342,34 @@ void FlightController::control_loop()
         const auto& p = latest_vehicle_state_.position;
         const auto& v = latest_vehicle_state_.velocity;
 
-        ControllerInput input;
+        PositionInput input;
 
-        input.position = Eigen::Vector3d(
+        const Eigen::Vector3d current_position(
             p.x, p.y, p.z);
 
-        input.velocity = Eigen::Vector3d(
+        const Eigen::Vector3d current_velocity(
             v.x, v.y, v.z);
 
-        input.target_position =
-            latest_reference_.position;
+        // Position error in ENU, m.
+        input.error =
+            latest_reference_.position - current_position;
+
+        // Error derivative for a fixed-position reference.
+        // For a moving reference, this should become
+        // reference_velocity - current_velocity.
+        input.error_rate = -current_velocity;
 
         input.dt = dt;
 
         const auto output =
             controller_->update(input);
 
-        if (!output.velocity_setpoint.allFinite()) {
+        if (!output.command.allFinite()) {
             throw std::runtime_error(
                 "Non-finite controller output");
         }
 
-        publish_velocity_setpoint(
-            output.velocity_setpoint);
+        publish_velocity_setpoint(output.command);
 
     } catch (const std::exception& e) {
         RCLCPP_ERROR(
