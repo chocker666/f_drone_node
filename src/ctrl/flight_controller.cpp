@@ -4,6 +4,7 @@
 #include <cmath>
 #include <functional>
 #include <stdexcept>
+#include <string>
 
 using drone_node::algorithm::PIDParameters;
 using PositionPID = drone_node::algorithm::PIDController<3>;
@@ -12,6 +13,38 @@ using YawInput = drone_node::algorithm::ControllerInput<1>;
 
 namespace
 {
+
+drone_node::algorithm::PIDParameters load_pid_parameters(
+    rclcpp::Node& node,
+    const std::string& prefix,
+    drone_node::algorithm::PIDLimitMode limit_mode)
+{
+    drone_node::algorithm::PIDParameters params;
+
+    params.kp = node.declare_parameter<double>(
+        prefix + ".kp", params.kp);
+
+    params.ki = node.declare_parameter<double>(
+        prefix + ".ki", params.ki);
+
+    params.kd = node.declare_parameter<double>(
+        prefix + ".kd", params.kd);
+
+    params.max_output = node.declare_parameter<double>(
+        prefix + ".max_output", params.max_output);
+
+    params.max_output_rate = node.declare_parameter<double>(
+        prefix + ".max_output_rate",
+        params.max_output_rate);
+
+    params.integral_limit = node.declare_parameter<double>(
+        prefix + ".integral_limit",
+        params.integral_limit);
+
+    params.limit_mode = limit_mode;
+
+    return params;
+}
 
 constexpr double PI = 3.14159265358979323846;
 constexpr double TWO_PI = 2.0 * PI;
@@ -51,8 +84,40 @@ FlightController::FlightController(
             "Invalid FlightController parameters");
     }
 
+    const auto position_pid_params = load_pid_parameters(
+        *this,
+        "position_pid",
+        drone_node::algorithm::PIDLimitMode::NORM);
+
+    const auto yaw_pid_params = load_pid_parameters(
+        *this,
+        "yaw_pid",
+        drone_node::algorithm::PIDLimitMode::PER_AXIS);
+
     controller_ =
-        std::make_unique<PositionPID>(PIDParameters{});
+        std::make_unique<PositionPID>(position_pid_params);
+
+    yaw_controller_.set_parameters(yaw_pid_params);
+
+    RCLCPP_INFO(
+        get_logger(),
+        "Position PID loaded: kp=%.3f ki=%.3f kd=%.3f, "
+        "max_output=%.3f, max_output_rate=%.3f",
+        position_pid_params.kp,
+        position_pid_params.ki,
+        position_pid_params.kd,
+        position_pid_params.max_output,
+        position_pid_params.max_output_rate);
+
+    RCLCPP_INFO(
+        get_logger(),
+        "Yaw PID loaded: kp=%.3f ki=%.3f kd=%.3f, "
+        "max_output=%.3f, max_output_rate=%.3f",
+        yaw_pid_params.kp,
+        yaw_pid_params.ki,
+        yaw_pid_params.kd,
+        yaw_pid_params.max_output,
+        yaw_pid_params.max_output_rate);
 
     vehicle_state_sub_ =
         create_subscription<VehicleState>(
@@ -359,19 +424,10 @@ void FlightController::trajectory_callback(
     }
 
     try {
-        auto* position_pid =
-            dynamic_cast<PositionPID*>(controller_.get());
-
-        if (!position_pid) {
-            throw std::runtime_error(
-                "Position PID unavailable");
-        }
-
-        position_pid->set_parameters(
-            trajectory_manager_.position_pid_parameters());
-
-        yaw_controller_.set_parameters(
-            trajectory_manager_.yaw_pid_parameters());
+        // New trajectory: reset controller states,
+        // but preserve PID configuration loaded at startup.
+        controller_->reset();
+        yaw_controller_.reset();
 
         yaw_reference_initialized_ = false;
         has_last_control_time_ = false;

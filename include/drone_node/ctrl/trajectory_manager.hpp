@@ -7,7 +7,6 @@
 #include <rclcpp/time.hpp>
 
 #include "drone_node/msg/control_trajectory.hpp"
-#include "drone_node/ctrl/algorithm/pid_controller.hpp"
 #include "drone_node/ctrl/trajectory_sampler/trajectory_sampler_base.hpp"
 #include "drone_node/types.hpp"
 
@@ -18,7 +17,6 @@ class TrajectoryManager
 {
 public:
     using ControlTrajectory = drone_node::msg::ControlTrajectory;
-    using PIDParameters = drone_node::algorithm::PIDParameters;
     using SamplerBase =
         drone_node::trajectory_sampler::TrajectorySamplerBase;
 
@@ -44,18 +42,12 @@ public:
 
     uint64_t trajectory_id() const noexcept;
 
-    const PIDParameters& position_pid_parameters() const;
-    const PIDParameters& yaw_pid_parameters() const;
-
     uint8_t yaw_direction() const noexcept;
 
     void clear() noexcept;
 
 private:
     std::unique_ptr<SamplerBase> sampler_;
-
-    PIDParameters position_pid_parameters_{};
-    PIDParameters yaw_pid_parameters_{};
 
     uint8_t yaw_direction_{
         drone_node::msg::FixedTrajectory::SHORTEST};
