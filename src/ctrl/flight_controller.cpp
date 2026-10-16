@@ -5,6 +5,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <limits>
 
 using drone_node::algorithm::PIDParameters;
 using PositionPID = drone_node::algorithm::PIDController<3>;
@@ -433,6 +434,13 @@ void FlightController::trajectory_callback(
         has_last_control_time_ = false;
         has_reference_ = false;
 
+        // Invalidate tracking errors from the previous trajectory.
+        position_error_ =
+            std::numeric_limits<double>::quiet_NaN();
+
+        yaw_error_ =
+            std::numeric_limits<double>::quiet_NaN();
+
         fault_code_ = ControlStatus::FAULT_NONE;
 
         change_control_state(
@@ -485,6 +493,13 @@ void FlightController::enter_fault(
     yaw_reference_initialized_ = false;
     has_reference_ = false;
     has_last_control_time_ = false;
+
+    // Tracking errors are invalid after entering FAULT.
+    position_error_ =
+        std::numeric_limits<double>::quiet_NaN();
+
+    yaw_error_ =
+        std::numeric_limits<double>::quiet_NaN();
 
     change_control_state(ControlStatus::FAULT);
 
@@ -609,6 +624,10 @@ void FlightController::control_loop()
                 "Non-finite controller output");
         }
 
+        // Update tracking errors after successful control computation.
+        position_error_ = position_input.error.norm();
+        yaw_error_ = yaw_input.error(0);
+
         publish_velocity_setpoint(
             position_output.command,
             yaw_output.command(0));
@@ -629,67 +648,15 @@ void FlightController::status_loop()
     ControlStatus status{};
 
     status.stamp = now();
+
     status.trajectory_id =
         trajectory_manager_.trajectory_id();
 
     status.state = control_state_;
     status.fault_code = fault_code_;
 
-    if (trajectory_manager_.has_trajectory()) {
-        status.trajectory_time =
-            trajectory_manager_.elapsed(now());
-    }
-
-    if (has_valid_state_) {
-        status.actual_position =
-            latest_vehicle_state_.position;
-
-        status.actual_velocity =
-            latest_vehicle_state_.velocity;
-    }
-
-    if (has_reference_ && has_valid_state_) {
-        status.reference_position.x =
-            latest_reference_.position.x();
-        status.reference_position.y =
-            latest_reference_.position.y();
-        status.reference_position.z =
-            latest_reference_.position.z();
-
-        status.reference_velocity.x =
-            latest_reference_.velocity.x();
-        status.reference_velocity.y =
-            latest_reference_.velocity.y();
-        status.reference_velocity.z =
-            latest_reference_.velocity.z();
-
-        const Eigen::Vector3d p(
-            status.actual_position.x,
-            status.actual_position.y,
-            status.actual_position.z);
-
-        const Eigen::Vector3d v(
-            status.actual_velocity.x,
-            status.actual_velocity.y,
-            status.actual_velocity.z);
-
-        const Eigen::Vector3d ep =
-            latest_reference_.position - p;
-
-        const Eigen::Vector3d ev =
-            latest_reference_.velocity - v;
-
-        status.position_error.x = ep.x();
-        status.position_error.y = ep.y();
-        status.position_error.z = ep.z();
-
-        status.velocity_error.x = ev.x();
-        status.velocity_error.y = ev.y();
-        status.velocity_error.z = ev.z();
-
-        status.position_error_norm = ep.norm();
-        status.velocity_error_norm = ev.norm();
-    }
+    status.position_error = position_error_;
+    status.yaw_error = yaw_error_;
 
     control_status_pub_->publish(status);
 }

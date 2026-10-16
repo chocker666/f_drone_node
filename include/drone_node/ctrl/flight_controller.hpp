@@ -17,6 +17,8 @@
 #include "drone_node/ctrl/trajectory_manager.hpp"
 #include "drone_node/types.hpp"
 
+#include <limits>
+
 class FlightController : public rclcpp::Node
 {
 public:
@@ -109,6 +111,13 @@ private:
 
     drone_node::ReferenceState latest_reference_{};
     bool has_reference_{false};
+    // Latest tracking errors calculated by control_loop().
+    // NaN means no valid tracking error is available.
+    double position_error_{
+        std::numeric_limits<double>::quiet_NaN()};
+
+    double yaw_error_{
+        std::numeric_limits<double>::quiet_NaN()};
 
     SteadyClock::time_point last_control_time_{};
     bool has_last_control_time_{false};
