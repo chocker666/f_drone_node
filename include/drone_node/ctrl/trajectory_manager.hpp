@@ -23,7 +23,6 @@ public:
     enum class AcceptResult
     {
         ACCEPTED,
-        DUPLICATE,
         REJECTED
     };
 
@@ -53,7 +52,6 @@ private:
         drone_node::msg::FixedTrajectory::SHORTEST};
 
     uint64_t trajectory_id_{0};
-    uint64_t last_accepted_id_{0};
 
     rclcpp::Time start_time_{0, 0, RCL_ROS_TIME};
 

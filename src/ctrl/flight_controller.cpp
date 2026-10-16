@@ -553,15 +553,6 @@ void FlightController::command_callback(
             return;
         }
 
-        if (msg->trajectory_id !=
-            trajectory_manager_.trajectory_id()) {
-
-            RCLCPP_WARN(
-                get_logger(),
-                "CANCEL rejected: trajectory ID mismatch");
-            return;
-        }
-
         try {
             enter_hover();
         } catch (const std::exception& e) {
@@ -670,11 +661,6 @@ void FlightController::trajectory_callback(
             "Trajectory %lu rejected: %s",
             static_cast<unsigned long>(msg->trajectory_id),
             reason.c_str());
-        return;
-    }
-
-    if (result ==
-        drone_node::TrajectoryManager::AcceptResult::DUPLICATE) {
         return;
     }
 

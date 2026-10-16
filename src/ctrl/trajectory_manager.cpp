@@ -16,22 +16,6 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
 {
     reason.clear();
 
-    if (msg.trajectory_id == 0) {
-        reason = "trajectory_id must be nonzero";
-        return AcceptResult::REJECTED;
-    }
-
-    if (msg.trajectory_id == last_accepted_id_ &&
-        last_accepted_id_ != 0) {
-        reason = "duplicate trajectory_id";
-        return AcceptResult::DUPLICATE;
-    }
-
-    if (msg.trajectory_id < last_accepted_id_) {
-        reason = "outdated trajectory_id";
-        return AcceptResult::REJECTED;
-    }
-
     if (msg.frame_id != "map") {
         reason = "unsupported frame_id";
         return AcceptResult::REJECTED;
@@ -79,7 +63,6 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
 
         start_time_ = new_start_time;
         trajectory_id_ = msg.trajectory_id;
-        last_accepted_id_ = msg.trajectory_id;
 
         has_trajectory_ = true;
 
