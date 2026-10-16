@@ -34,6 +34,7 @@ set(CTRL_MSG_FILES
   "msg/FixedTrajectory.msg"
   "msg/PIDParams.msg"
   "msg/ControlStatus.msg"
+  "msg/ControlCommand.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

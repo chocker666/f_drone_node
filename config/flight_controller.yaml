@@ -7,7 +7,7 @@ flight_controller:
     state_timeout: 0.2
 
     # Safety: keep disabled until explicitly enabled
-    enable_setpoint_stream: false
+    enable_setpoint_stream: true
 
     # Position PID: position error -> velocity command
     position_pid:
