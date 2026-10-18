@@ -1,0 +1,11 @@
+std_msgs/Header header
+geometry_msgs/Point position
+float64 yaw
+---
+bool success
+uint16 error_code
+string message
+---
+string phase
+float32 progress
+float64 remaining_distance

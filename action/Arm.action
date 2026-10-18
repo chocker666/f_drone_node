@@ -1,0 +1,7 @@
+---
+bool success
+uint16 error_code
+string message
+---
+uint8 stage
+string message

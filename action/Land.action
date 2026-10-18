@@ -1,0 +1,10 @@
+# Positive downward speed magnitude, m/s
+float64 descent_speed
+---
+bool success
+uint16 error_code
+string message
+---
+string phase
+float32 progress
+float64 current_height
