@@ -215,6 +215,8 @@ target_link_libraries(attitude_test
 add_executable(motion_executor_exec
   src/main/exec_main.cpp
   src/exec/motion_executor.cpp
+  src/exec/action_manager.cpp
+  src/exec/flight_state_machine.cpp
 )
 
 target_include_directories(motion_executor_exec PUBLIC
