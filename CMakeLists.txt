@@ -11,6 +11,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -19,6 +20,7 @@ find_package(Eigen3 REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(Threads REQUIRED)
+
 
 # ============================================================
 # ROS2 interfaces
@@ -37,12 +39,28 @@ set(CTRL_MSG_FILES
   "msg/ControlCommand.msg"
 )
 
+set(EXEC_ACTION_FILES
+  "action/GoTo.action"
+  "action/Takeoff.action"
+  "action/Land.action"
+  "action/Arm.action"
+  "action/Disarm.action"
+  "action/Stop.action"
+)
+
+set(EXEC_SRV_FILES
+  "srv/SetArming.srv"
+)
+
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${INTER_MSG_FILES}
   ${CTRL_MSG_FILES}
+  ${EXEC_ACTION_FILES}
+  ${EXEC_SRV_FILES}
   DEPENDENCIES
     builtin_interfaces
     geometry_msgs
+    std_msgs
 )
 
 rosidl_get_typesupport_target(cpp_typesupport_target
@@ -189,6 +207,32 @@ target_link_libraries(attitude_test
   "${cpp_typesupport_target}"
 )
 
+
+# ============================================================
+# Motion Executor executable
+# ============================================================
+
+add_executable(motion_executor_exec
+  src/main/exec_main.cpp
+  src/exec/motion_executor.cpp
+)
+
+target_include_directories(motion_executor_exec PUBLIC
+  ${DRONE_INCLUDE_DIR}
+)
+
+ament_target_dependencies(motion_executor_exec
+  rclcpp
+  rclcpp_action
+  std_msgs
+  geometry_msgs
+)
+
+target_link_libraries(motion_executor_exec
+  "${cpp_typesupport_target}"
+)
+
+
 # ============================================================
 # Install
 # ============================================================
@@ -197,6 +241,7 @@ install(TARGETS
   drone_node_exec
   px4_interface_exec
   flight_controller_exec
+  motion_executor_exec
   attitude_test
   DESTINATION lib/${PROJECT_NAME}
 )
