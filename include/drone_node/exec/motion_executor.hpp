@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
@@ -21,8 +22,7 @@
 
 #include "drone_node/exec/action_manager.hpp"
 #include "drone_node/exec/flight_state_machine.hpp"
-
-#include <vector>
+#include "drone_node/exec/planner/motion_planner.hpp"
 
 namespace drone_node::exec
 {
@@ -61,6 +61,7 @@ private:
         Clock::time_point started_at{};
 
         std::function<void(double)> feedback;
+
         std::function<void(
             ActionState,
             const std::string&,
@@ -99,6 +100,11 @@ private:
 
     static std::string uuid_key(const GoalUUID& uuid);
 
+    // 第三阶段：GoTo Action -> MotionPlanner。
+    bool plan_goto(
+        ActionId id,
+        const GoTo::Goal& goal);
+
     void update_mock();
     void process_events();
 
@@ -121,15 +127,25 @@ private:
     std::shared_ptr<FlightStateMachine> fsm_;
     std::shared_ptr<ActionManager> manager_;
 
+    // 第三阶段：统一规划入口。
+    std::unique_ptr<MotionPlanner> planner_;
+
     rclcpp::TimerBase::SharedPtr mock_timer_;
 
-    // UUID -> ActionId：连接 ROS Goal 与内部动作。
+    // UUID -> ActionId。
     std::unordered_map<std::string, ActionId> uuid_to_id_;
 
-    // ActionId -> ROS GoalHandle 适配器。
+    // ActionId -> GoalHandle 适配器。
     std::unordered_map<ActionId, GoalBinding> bindings_;
 
-    // 保护 Goal 回调和定时器中的映射操作。
+    // 已通过校验并被接受的 GoTo Goal。
+    // 采用值拷贝，避免 Action 生命周期悬空引用。
+    std::unordered_map<ActionId, GoTo::Goal> goto_goals_;
+
+    // 规划成功的轨迹缓存，供第四阶段 Coordinator 使用。
+    std::unordered_map<ActionId, PlannedMotion> planned_motions_;
+
+    // 保护 Action 和规划缓存。
     std::mutex mutex_;
 
     double mock_duration_{3.0};
@@ -139,7 +155,7 @@ private:
 
     std::vector<ActionEvent> deferred_events_;
 
-    // 仅用于 Mock，不代表真实 PX4 观测。
+    // Mock 状态不代表真实 PX4 观测。
     VehicleSnapshot mock_snapshot_{};
 };
 

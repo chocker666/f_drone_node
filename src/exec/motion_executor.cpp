@@ -38,21 +38,6 @@ const char* action_name()
         static_assert(always_false_v<ActionT>, "Unsupported Action");
 }
 
-bool terminal(ActionState state)
-{
-    return state == ActionState::SUCCEEDED ||
-           state == ActionState::CANCELED ||
-           state == ActionState::FAILED;
-}
-
-bool motion_action(ActionType type)
-{
-    return type == ActionType::TAKEOFF ||
-           type == ActionType::LAND ||
-           type == ActionType::GOTO ||
-           type == ActionType::STOP;
-}
-
 }  // namespace
 
 MotionExecutor::MotionExecutor(
@@ -90,8 +75,12 @@ MotionExecutor::MotionExecutor(
             "must be finite and positive");
     }
 
+
     fsm_ = std::make_shared<FlightStateMachine>();
     manager_ = std::make_shared<ActionManager>(fsm_);
+
+    planner_ = std::make_unique<MotionPlanner>();
+
 
     mock_snapshot_.connected = true;
     mock_snapshot_.position_valid = true;
@@ -272,6 +261,23 @@ rclcpp_action::GoalResponse MotionExecutor::handle_goal(
 
     bindings_.emplace(submitted.id, std::move(binding));
 
+
+    if constexpr (std::is_same_v<ActionT, GoTo>) {
+        goto_goals_.emplace(submitted.id, *goal);
+
+        RCLCPP_INFO(
+            get_logger(),
+            "[GoTo] Goal stored: ActionId=%llu, "
+            "frame=%s, target=(%.3f, %.3f, %.3f), yaw=%.3f rad",
+            static_cast<unsigned long long>(submitted.id),
+            goal->header.frame_id.c_str(),
+            goal->position.x,
+            goal->position.y,
+            goal->position.z,
+            goal->yaw);
+    }
+
+
     RCLCPP_INFO(
         get_logger(),
         "%s accepted: ActionId=%llu",
@@ -327,15 +333,152 @@ void MotionExecutor::handle_accepted(
 
     attach_goal<ActionT>(id, handle);
 
-    // Stop 可能在旧 Goal 的 accepted 回调之前到达。
-    // 此时旧动作已被抢占，不允许重新启动。
+    // Stop 可能先于旧 Goal 的 accepted 回调到达。
+    // 被抢占的动作不能重新启动或重新规划。
     if (!manager_->start(id)) {
         RCLCPP_WARN(
             get_logger(),
-            "ActionId=%llu cannot start (possibly preempted)",
+            "ActionId=%llu cannot start "
+            "(possibly preempted)",
             static_cast<unsigned long long>(id));
+        return;
+    }
+
+    // 只有 GoTo 需要进入本阶段的 FixedPlanner。
+    if constexpr (std::is_same_v<ActionT, GoTo>) {
+
+        const auto goal_it = goto_goals_.find(id);
+
+        if (goal_it == goto_goals_.end()) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "[Planner] Missing GoTo Goal: ActionId=%llu",
+                static_cast<unsigned long long>(id));
+
+            manager_->fail(
+                id,
+                "Accepted GoTo Goal data missing");
+            return;
+        }
+
+        if (!plan_goto(id, goal_it->second)) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[Planner] GoTo planning did not complete: "
+                "ActionId=%llu",
+                static_cast<unsigned long long>(id));
+        }
     }
 }
+
+
+
+bool MotionExecutor::plan_goto(
+    ActionId id,
+    const GoTo::Goal& goal)
+{
+    PlanningRequest request;
+
+    request.action_id = id;
+    request.planner_type = PlannerType::FIXED;
+    request.frame_id = goal.header.frame_id;
+
+    request.target_position = Eigen::Vector3d(
+        goal.position.x,
+        goal.position.y,
+        goal.position.z);
+
+    request.target_yaw = goal.yaw;
+
+    // GoTo.action 尚无 yaw_direction 字段。
+    // 默认采用最短旋转方向。
+    request.yaw_direction = 0;
+
+    RCLCPP_INFO(
+        get_logger(),
+        "[Planner] Request: ActionId=%llu, "
+        "type=FIXED, frame=%s, "
+        "position=(%.3f, %.3f, %.3f), yaw=%.3f",
+        static_cast<unsigned long long>(id),
+        request.frame_id.c_str(),
+        request.target_position.x(),
+        request.target_position.y(),
+        request.target_position.z(),
+        request.target_yaw);
+
+    PlanningResult result;
+
+    try {
+        result = planner_->plan(request);
+    }
+    catch (const std::exception& e) {
+        RCLCPP_ERROR(
+            get_logger(),
+            "[Planner] Exception: ActionId=%llu, %s",
+            static_cast<unsigned long long>(id),
+            e.what());
+
+        manager_->fail(
+            id,
+            std::string("Planning exception: ") + e.what());
+
+        return false;
+    }
+
+    if (!result.success()) {
+        RCLCPP_ERROR(
+            get_logger(),
+            "[Planner] Failed: ActionId=%llu, %s",
+            static_cast<unsigned long long>(id),
+            result.reason.c_str());
+
+        manager_->fail(
+            id,
+            "Planning failed: " + result.reason);
+
+        return false;
+    }
+
+    // 防止规划期间动作已被取消或抢占。
+    const auto record = manager_->get(id);
+    const auto active = manager_->active_action();
+
+    if (!record ||
+        record->state != ActionState::EXECUTING ||
+        !active ||
+        *active != id) {
+
+        RCLCPP_WARN(
+            get_logger(),
+            "[Planner] Result discarded: "
+            "ActionId=%llu is no longer active",
+            static_cast<unsigned long long>(id));
+
+        return false;
+    }
+
+    planned_motions_.insert_or_assign(
+        id,
+        result.motion);
+
+    RCLCPP_INFO(
+        get_logger(),
+        "[Planner] SUCCESS: ActionId=%llu, "
+        "frame=%s, target=(%.3f, %.3f, %.3f), "
+        "yaw=%.3f rad, direction=%u",
+        static_cast<unsigned long long>(id),
+        result.motion.frame_id.c_str(),
+        result.motion.target_position.x(),
+        result.motion.target_position.y(),
+        result.motion.target_position.z(),
+        result.motion.target_yaw,
+        static_cast<unsigned int>(
+            result.motion.yaw_direction));
+
+    return true;
+}
+
+
 
 template<typename ActionT>
 void MotionExecutor::attach_goal(
@@ -563,6 +706,10 @@ void MotionExecutor::process_events()
             }
         }
 
+
+        goto_goals_.erase(event.id);
+        planned_motions_.erase(event.id);
+
         bindings_.erase(it);
 
         RCLCPP_INFO(
@@ -592,10 +739,20 @@ void MotionExecutor::update_mock()
             binding_it != bindings_.end() &&
             binding_it->second.attached) {
 
+
             const auto state = record->state;
 
-            if (state == ActionState::EXECUTING ||
-                state == ActionState::CANCELING) {
+            // 正常执行的 GoTo 必须先成功产生规划结果。
+            // Cancel/Stop 期间不依赖原规划结果。
+            const bool waiting_for_plan =
+                record->type == ActionType::GOTO &&
+                state == ActionState::EXECUTING &&
+                planned_motions_.find(id) == planned_motions_.end();
+
+            if (!waiting_for_plan &&
+                (state == ActionState::EXECUTING ||
+                state == ActionState::CANCELING)) {
+
 
                 const auto now = Clock::now();
 

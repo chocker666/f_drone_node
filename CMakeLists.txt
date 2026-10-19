@@ -217,6 +217,8 @@ add_executable(motion_executor_exec
   src/exec/motion_executor.cpp
   src/exec/action_manager.cpp
   src/exec/flight_state_machine.cpp
+  src/exec/planner/motion_planner.cpp
+  src/exec/planner/fixed_planner.cpp
 )
 
 target_include_directories(motion_executor_exec PUBLIC
@@ -231,6 +233,7 @@ ament_target_dependencies(motion_executor_exec
 )
 
 target_link_libraries(motion_executor_exec
+  Eigen3::Eigen
   "${cpp_typesupport_target}"
 )
 
