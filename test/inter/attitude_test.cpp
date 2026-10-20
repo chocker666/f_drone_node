@@ -11,7 +11,7 @@ public:
     {
         subscription_ =
             create_subscription<geometry_msgs::msg::QuaternionStamped>(
-                "/out/attitude", rclcpp::QoS(1).reliable(),
+                "/px4_interface/out/attitude", rclcpp::QoS(1).reliable(),
                 [this](
                     geometry_msgs::msg::QuaternionStamped::SharedPtr msg) {
                     const auto &q = msg->quaternion;

@@ -120,17 +120,17 @@ FlightController::FlightController(
     const auto feedback_qos = rclcpp::QoS(1).reliable();
 
     position_sub_ = create_subscription<PointStamped>(
-        "/out/position", feedback_qos,
+        "/px4_interface/out/position", feedback_qos,
         std::bind(&FlightController::position_callback,
                 this, std::placeholders::_1));
 
     velocity_sub_ = create_subscription<VectorStamped>(
-        "/out/velocity", feedback_qos,
+        "/px4_interface/out/velocity", feedback_qos,
         std::bind(&FlightController::velocity_callback,
                 this, std::placeholders::_1));
 
     attitude_sub_ = create_subscription<QuaternionStamped>(
-        "/out/attitude", feedback_qos,
+        "/px4_interface/out/attitude", feedback_qos,
         std::bind(&FlightController::attitude_callback,
                 this, std::placeholders::_1));
 
@@ -171,7 +171,7 @@ FlightController::FlightController(
                 std::placeholders::_1));
 
     trajectory_setpoint_pub_ = create_publisher<Setpoint>(
-        "/in/setpoint", rclcpp::QoS(1).reliable());
+        "/px4_interface/in/setpoint", rclcpp::QoS(1).reliable());
 
     control_status_pub_ =
         create_publisher<ControlStatus>(

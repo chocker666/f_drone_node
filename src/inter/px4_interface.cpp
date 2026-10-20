@@ -266,17 +266,17 @@ struct PX4Interface::Impl
         source_system = identifier("source_system");
         source_component = identifier("source_component");
 
-        arm_pub = publisher<Bool>("arm_topic", "/out/arm");
-        connected_pub = publisher<Bool>("connected_topic", "/out/connected");
-        landed_pub = publisher<Bool>("landed_topic", "/out/landed");
+        arm_pub = publisher<Bool>("arm_topic", "/px4_interface/out/arm");
+        connected_pub = publisher<Bool>("connected_topic", "/px4_interface/out/connected");
+        landed_pub = publisher<Bool>("landed_topic", "/px4_interface/out/landed");
         battery_pub = publisher<drone_node::msg::Battery>(
-            "battery_topic", "/out/battery");
+            "battery_topic", "/px4_interface/out/battery");
         position_pub = publisher<PointStamped>(
-            "position_topic", "/out/position", 1);
+            "position_topic", "/px4_interface/out/position", 1);
         velocity_pub = publisher<VectorStamped>(
-            "velocity_topic", "/out/velocity", 1);
+            "velocity_topic", "/px4_interface/out/velocity", 1);
         attitude_pub = publisher<QuaternionStamped>(
-            "attitude_topic", "/out/attitude", 1);
+            "attitude_topic", "/px4_interface/out/attitude", 1);
 
         trajectory_pub = publisher<Trajectory>(
             "px4_trajectory_setpoint_topic", "/fmu/in/trajectory_setpoint", 1);
@@ -328,7 +328,7 @@ struct PX4Interface::Impl
             });
 
         subscribe<Setpoint>(
-            "setpoint_topic", "/in/setpoint",
+            "setpoint_topic", "/px4_interface/in/setpoint",
             rclcpp::QoS(1).reliable(), control_group,
             [this](Setpoint::SharedPtr msg) {
                 if (!valid_setpoint(*msg)) {
@@ -348,7 +348,7 @@ struct PX4Interface::Impl
             rmw_qos_profile_services_default, command_group);
 
         arm_service = node.create_service<Arm>(
-            parameter<std::string>("arm_service", "/in/arm"),
+            parameter<std::string>("arm_service", "/px4_interface/in/arm"),
             [this](Header header, Arm::Request::SharedPtr request) {
                 arm_request(std::move(header), request->arm);
             },

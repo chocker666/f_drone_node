@@ -24,16 +24,16 @@ px4_interface:
     vehicle_local_position_topic: /fmu/out/vehicle_local_position_v1
     vehicle_attitude_topic: /fmu/out/vehicle_attitude
 
-    arm_topic: /out/arm
-    connected_topic: /out/connected
-    landed_topic: /out/landed
-    battery_topic: /out/battery
-    position_topic: /out/position
-    velocity_topic: /out/velocity
-    attitude_topic: /out/attitude
+    arm_topic: /px4_interface/out/arm
+    connected_topic: /px4_interface/out/connected
+    landed_topic: /px4_interface/out/landed
+    battery_topic: /px4_interface/out/battery
+    position_topic: /px4_interface/out/position
+    velocity_topic: /px4_interface/out/velocity
+    attitude_topic: /px4_interface/out/attitude
 
-    setpoint_topic: /in/setpoint
-    arm_service: /in/arm
+    setpoint_topic: /px4_interface/in/setpoint
+    arm_service: /px4_interface/in/arm
     vehicle_command_service: /fmu/vehicle_command
 
     px4_trajectory_setpoint_topic: /fmu/in/trajectory_setpoint
