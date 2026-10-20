@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.8)
 project(drone_node)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -27,8 +30,8 @@ find_package(Threads REQUIRED)
 # ============================================================
 
 set(INTER_MSG_FILES
-  "msg/VehicleState.msg"
-  "msg/TrajectorySetpoint.msg"
+  "msg/Battery.msg"
+  "msg/Setpoint.msg"
 )
 
 set(CTRL_MSG_FILES
@@ -148,6 +151,7 @@ target_include_directories(flight_controller_exec PUBLIC
 
 ament_target_dependencies(flight_controller_exec
   rclcpp
+  std_msgs
   geometry_msgs
 )
 
@@ -199,7 +203,7 @@ target_include_directories(attitude_test PUBLIC
 
 ament_target_dependencies(attitude_test
   rclcpp
-  px4_msgs
+  geometry_msgs
 )
 
 target_link_libraries(attitude_test
@@ -273,5 +277,6 @@ if(BUILD_TESTING)
 
   ament_lint_auto_find_test_dependencies()
 endif()
+ament_export_dependencies(rosidl_default_runtime)
 
 ament_package()

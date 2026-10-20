@@ -1,6 +1,4 @@
-# true: arm; false: disarm
 bool arm
 ---
-bool accepted
-bool command_sent
+bool success
 string message

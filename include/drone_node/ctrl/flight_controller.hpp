@@ -11,8 +11,12 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 
-#include "drone_node/msg/vehicle_state.hpp"
-#include "drone_node/msg/trajectory_setpoint.hpp"
+#include <array>
+#include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <geometry_msgs/msg/quaternion_stamped.hpp>
+#include "drone_node/msg/setpoint.hpp"
+
 #include "drone_node/msg/control_trajectory.hpp"
 #include "drone_node/msg/control_status.hpp"
 #include "drone_node/msg/control_command.hpp"
@@ -39,11 +43,12 @@ private:
     // Type aliases
     // ========================================================
 
-    using VehicleState =
-        drone_node::msg::VehicleState;
+    using Setpoint = drone_node::msg::Setpoint;
+    using PointStamped = geometry_msgs::msg::PointStamped;
+    using VectorStamped = geometry_msgs::msg::Vector3Stamped;
+    using QuaternionStamped = geometry_msgs::msg::QuaternionStamped;
 
-    using TrajectorySetpoint =
-        drone_node::msg::TrajectorySetpoint;
+
 
     using ControlTrajectory =
         drone_node::msg::ControlTrajectory;
@@ -63,14 +68,21 @@ private:
     using SteadyClock =
         std::chrono::steady_clock;
 
+    struct Feedback
+    {
+        geometry_msgs::msg::Point position;
+        geometry_msgs::msg::Vector3 velocity;
+        geometry_msgs::msg::Quaternion orientation;
+    };
 
     // ========================================================
     // ROS callbacks
     // ========================================================
 
     // Vehicle position, velocity and attitude feedback.
-    void vehicle_state_callback(
-        const VehicleState::SharedPtr msg);
+    void position_callback(const PointStamped::SharedPtr msg);
+    void velocity_callback(const VectorStamped::SharedPtr msg);
+    void attitude_callback(const QuaternionStamped::SharedPtr msg);
 
     // Receive and replace the active trajectory.
     void trajectory_callback(
@@ -232,11 +244,9 @@ private:
     // Vehicle feedback
     // ========================================================
 
-    VehicleState latest_vehicle_state_{};
-
-    bool has_valid_state_{false};
-
-    SteadyClock::time_point last_state_receive_time_{};
+    Feedback latest_vehicle_state_{};
+    std::array<bool, 3> feedback_received_{};
+    std::array<SteadyClock::time_point, 3> feedback_time_{};
 
 
     // ========================================================
@@ -315,8 +325,9 @@ private:
     // ROS subscriptions
     // ========================================================
 
-    rclcpp::Subscription<VehicleState>::SharedPtr
-        vehicle_state_sub_;
+    rclcpp::Subscription<PointStamped>::SharedPtr position_sub_;
+    rclcpp::Subscription<VectorStamped>::SharedPtr velocity_sub_;
+    rclcpp::Subscription<QuaternionStamped>::SharedPtr attitude_sub_;
 
     rclcpp::Subscription<ControlTrajectory>::SharedPtr
         trajectory_sub_;
@@ -335,8 +346,7 @@ private:
     // ROS publishers
     // ========================================================
 
-    rclcpp::Publisher<TrajectorySetpoint>::SharedPtr
-        trajectory_setpoint_pub_;
+    rclcpp::Publisher<Setpoint>::SharedPtr trajectory_setpoint_pub_;
 
     rclcpp::Publisher<ControlStatus>::SharedPtr
         control_status_pub_;

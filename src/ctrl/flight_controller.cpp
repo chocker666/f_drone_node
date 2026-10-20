@@ -117,14 +117,22 @@ FlightController::FlightController(
         yaw_pid_params.max_output,
         yaw_pid_params.max_output_rate);
 
-    vehicle_state_sub_ =
-        create_subscription<VehicleState>(
-            "/px4_interface/out/vehicle_state",
-            rclcpp::QoS(1),
-            std::bind(
-                &FlightController::vehicle_state_callback,
-                this,
-                std::placeholders::_1));
+    const auto feedback_qos = rclcpp::QoS(1).reliable();
+
+    position_sub_ = create_subscription<PointStamped>(
+        "/out/position", feedback_qos,
+        std::bind(&FlightController::position_callback,
+                this, std::placeholders::_1));
+
+    velocity_sub_ = create_subscription<VectorStamped>(
+        "/out/velocity", feedback_qos,
+        std::bind(&FlightController::velocity_callback,
+                this, std::placeholders::_1));
+
+    attitude_sub_ = create_subscription<QuaternionStamped>(
+        "/out/attitude", feedback_qos,
+        std::bind(&FlightController::attitude_callback,
+                this, std::placeholders::_1));
 
     trajectory_sub_ =
         create_subscription<ControlTrajectory>(
@@ -155,17 +163,15 @@ FlightController::FlightController(
 
     armed_sub_ =
         create_subscription<std_msgs::msg::Bool>(
-            "/px4_interface/out/armed",
+            "/px4_interface/out/arm",
             rclcpp::QoS(10),
             std::bind(
                 &FlightController::armed_callback,
                 this,
                 std::placeholders::_1));
 
-    trajectory_setpoint_pub_ =
-        create_publisher<TrajectorySetpoint>(
-            "/px4_interface/in/trajectory_setpoint",
-            rclcpp::QoS(1));
+    trajectory_setpoint_pub_ = create_publisher<Setpoint>(
+        "/in/setpoint", rclcpp::QoS(1).reliable());
 
     control_status_pub_ =
         create_publisher<ControlStatus>(
@@ -338,59 +344,65 @@ void FlightController::initialize_yaw_reference(
         delta * RAD_TO_DEG);
 }
 
-void FlightController::vehicle_state_callback(
-    const VehicleState::SharedPtr msg)
+void FlightController::position_callback(const PointStamped::SharedPtr msg)
 {
-    const auto& p = msg->position;
-    const auto& v = msg->velocity;
-    const auto& q = msg->orientation;
-
-    const double q_norm_squared =
-        q.x * q.x + q.y * q.y +
-        q.z * q.z + q.w * q.w;
-
-    const bool valid =
-        std::isfinite(p.x) &&
-        std::isfinite(p.y) &&
-        std::isfinite(p.z) &&
-        std::isfinite(v.x) &&
-        std::isfinite(v.y) &&
-        std::isfinite(v.z) &&
-        std::isfinite(q.x) &&
-        std::isfinite(q.y) &&
-        std::isfinite(q.z) &&
-        std::isfinite(q.w) &&
-        std::isfinite(q_norm_squared) &&
-        q_norm_squared > 1e-6;
-
-    if (!valid) {
-        RCLCPP_WARN_THROTTLE(
-            get_logger(),
-            *get_clock(),
-            1000,
-            "Invalid vehicle state");
+    const auto &p = msg->point;
+    if (!std::isfinite(p.x) ||
+        !std::isfinite(p.y) ||
+        !std::isfinite(p.z))
         return;
-    }
 
-    latest_vehicle_state_ = *msg;
-    has_valid_state_ = true;
-    last_state_receive_time_ = SteadyClock::now();
+    latest_vehicle_state_.position = p;
+    feedback_received_[0] = true;
+    feedback_time_[0] = SteadyClock::now();
+}
 
+void FlightController::velocity_callback(const VectorStamped::SharedPtr msg)
+{
+    const auto &v = msg->vector;
+    if (!std::isfinite(v.x) ||
+        !std::isfinite(v.y) ||
+        !std::isfinite(v.z))
+        return;
+
+    latest_vehicle_state_.velocity = v;
+    feedback_received_[1] = true;
+    feedback_time_[1] = SteadyClock::now();
+}
+
+void FlightController::attitude_callback(const QuaternionStamped::SharedPtr msg)
+{
+    auto q = msg->quaternion;
+    const double norm2 =
+        q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    if (!std::isfinite(norm2) || norm2 <= 1e-12)
+        return;
+
+    const double norm = std::sqrt(norm2);
+    q.w /= norm;
+    q.x /= norm;
+    q.y /= norm;
+    q.z /= norm;
+
+    latest_vehicle_state_.orientation = q;
+    feedback_received_[2] = true;
+    feedback_time_[2] = SteadyClock::now();
     update_unwrapped_yaw(yaw_from_quaternion(q));
 }
 
 bool FlightController::state_is_fresh() const
 {
-    if (!has_valid_state_ || !has_yaw_measurement_) {
+    if (!has_yaw_measurement_)
         return false;
+
+    const auto now = SteadyClock::now();
+    for (size_t i = 0; i < feedback_received_.size(); ++i) {
+        if (!feedback_received_[i] ||
+            std::chrono::duration<double>(
+                now - feedback_time_[i]).count() > state_timeout_)
+            return false;
     }
-
-    const double age =
-        std::chrono::duration<double>(
-            SteadyClock::now() -
-            last_state_receive_time_).count();
-
-    return age <= state_timeout_;
+    return true;
 }
 
 FlightController::FixedTrajectory
@@ -681,10 +693,9 @@ void FlightController::publish_velocity_setpoint(
     const Eigen::Vector3d& velocity,
     double yaw_rate)
 {
-    TrajectorySetpoint setpoint{};
-
+    Setpoint setpoint{};
     setpoint.stamp = now();
-    setpoint.control_mode = TrajectorySetpoint::VELOCITY;
+    setpoint.control_mode = Setpoint::VELOCITY;
 
     setpoint.velocity.x = velocity.x();
     setpoint.velocity.y = velocity.y();
