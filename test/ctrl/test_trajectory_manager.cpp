@@ -161,11 +161,11 @@ void test_manager()
     assert_rejected_without_replacement(invalid);
 
     invalid = point(3, 0.0, 0.0);
-    invalid.controller_id = "unsupported";
+    invalid.controller_id.clear();
     assert_rejected_without_replacement(invalid);
 
     invalid = point(3, 0.0, 0.0);
-    invalid.config_name = "unsupported";
+    invalid.config_name.clear();
     assert_rejected_without_replacement(invalid);
 
     bool rejected = false;

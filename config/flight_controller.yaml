@@ -6,22 +6,49 @@ flight_controller:
     state_timeout: 0.2
 
     hover:
-      speed_threshold: 0.1       # m/s
-      yaw_rate_threshold: 0.1    # rad/s
-      settle_duration: 0.3       # s
+      speed_threshold: 0.1
+      yaw_rate_threshold: 0.1
+      settle_duration: 0.3
 
-    position_pid:
-      kp: 0.8
-      ki: 0.0
-      kd: 0.0
-      max_output: 1.0           # m/s
-      max_output_rate: 1.0      # m/s^2
-      integral_limit: 1.0       # m*s
+    controllers:
+      position_yaw_pid:
+        config_names: ["default", "slow"]
 
-    yaw_pid:
-      kp: 0.8
-      ki: 0.0
-      kd: 0.0
-      max_output: 1.0           # rad/s
-      max_output_rate: 1.0      # rad/s^2
-      integral_limit: 1.0       # rad*s
+        configs:
+          default:
+            position_pid:
+              kp: 0.8
+              ki: 0.0
+              kd: 0.0
+              max_output: 1.0
+              max_output_rate: 1.0
+              integral_limit: 1.0
+              limit_mode: "norm"
+
+            yaw_pid:
+              kp: 0.8
+              ki: 0.0
+              kd: 0.0
+              max_output: 1.0
+              max_output_rate: 1.0
+              integral_limit: 1.0
+              limit_mode: "per_axis"
+
+          slow:
+            position_pid:
+              kp: 0.8
+              ki: 0.0
+              kd: 0.0
+              max_output: 0.2
+              max_output_rate: 0.4
+              integral_limit: 1.0
+              limit_mode: "norm"
+
+            yaw_pid:
+              kp: 0.8
+              ki: 0.0
+              kd: 0.0
+              max_output: 0.5
+              max_output_rate: 0.5
+              integral_limit: 1.0
+              limit_mode: "per_axis"

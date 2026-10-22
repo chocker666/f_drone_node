@@ -19,6 +19,9 @@
 #include "drone_node/ctrl/state_cache.hpp"
 #include "drone_node/ctrl/hover_reference.hpp"
 
+#include <map>
+#include <string>
+
 class FlightController : public rclcpp::Node
 {
 public:
@@ -64,6 +67,10 @@ private:
     unsigned consecutive_overruns_{0};
 
     drone_node::controller::PositionYawPIDConfig controller_config_{};
+    std::map<
+        std::string,
+        drone_node::controller::PositionYawPIDConfig>
+        controller_configs_;
     drone_node::HoverReference::Config hover_config_{};
 
     std::unique_ptr<drone_node::StateCache> state_cache_;
@@ -94,4 +101,6 @@ private:
 
     rclcpp::TimerBase::SharedPtr control_timer_;
     rclcpp::TimerBase::SharedPtr status_timer_;
+
+    void load_controller_configs();
 };

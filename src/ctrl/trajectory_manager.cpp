@@ -22,13 +22,8 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
         return AcceptResult::REJECTED;
     }
 
-    if (msg.controller_id != "position_yaw_pid") {
-        reason = "unsupported controller_id";
-        return AcceptResult::REJECTED;
-    }
-
-    if (msg.config_name != "default") {
-        reason = "unsupported config_name";
+    if (msg.controller_id.empty() || msg.config_name.empty()) {
+        reason = "missing controller or configuration selection";
         return AcceptResult::REJECTED;
     }
 

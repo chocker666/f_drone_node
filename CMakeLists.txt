@@ -284,6 +284,37 @@ endif()
 # ============================================================
 
 if(BUILD_TESTING)
+  enable_testing()
+    add_executable(test_flight_controller_integration
+    test/ctrl/test_flight_controller_integration.cpp
+    ${CTRL_SOURCES}
+  )
+
+  target_include_directories(test_flight_controller_integration PRIVATE
+    ${DRONE_INCLUDE_DIR}
+  )
+
+  ament_target_dependencies(test_flight_controller_integration
+    rclcpp
+    geometry_msgs
+  )
+
+  target_link_libraries(test_flight_controller_integration
+    drone_physical_controllers
+    Threads::Threads
+    "${cpp_typesupport_target}"
+  )
+
+  add_test(
+    NAME flight_controller_integration
+    COMMAND test_flight_controller_integration
+  )
+
+  set_tests_properties(flight_controller_integration PROPERTIES
+    TIMEOUT 60
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ROS_DOMAIN_ID=171;ROS_LOCALHOST_ONLY=1"
+  )
   add_executable(test_state_cache_hover
     test/ctrl/test_state_cache_hover.cpp
   )

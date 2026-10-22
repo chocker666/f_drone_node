@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
+
 
 namespace
 {
@@ -43,8 +45,10 @@ std::chrono::nanoseconds timer_period(double frequency)
 drone_node::algorithm::PIDParameters load_pid_parameters(
     rclcpp::Node& node,
     const std::string& prefix,
-    drone_node::algorithm::PIDLimitMode mode)
+    drone_node::algorithm::PIDLimitMode default_mode)
 {
+    using Mode = drone_node::algorithm::PIDLimitMode;
+
     drone_node::algorithm::PIDParameters parameters;
 
     parameters.kp = node.declare_parameter<double>(
@@ -65,7 +69,19 @@ drone_node::algorithm::PIDParameters load_pid_parameters(
         prefix + ".integral_limit",
         parameters.integral_limit);
 
-    parameters.limit_mode = mode;
+    const std::string mode = node.declare_parameter<std::string>(
+        prefix + ".limit_mode",
+        default_mode == Mode::NORM ? "norm" : "per_axis");
+
+    if (mode == "norm") {
+        parameters.limit_mode = Mode::NORM;
+    } else if (mode == "per_axis") {
+        parameters.limit_mode = Mode::PER_AXIS;
+    } else {
+        throw std::invalid_argument(
+            "Unsupported PID limit_mode at " + prefix);
+    }
+
     return parameters;
 }
 
@@ -110,15 +126,7 @@ FlightController::FlightController(
             "Invalid scheduling or timeout parameters");
     }
 
-    controller_config_.position = load_pid_parameters(
-        *this,
-        "position_pid",
-        drone_node::algorithm::PIDLimitMode::NORM);
-
-    controller_config_.yaw = load_pid_parameters(
-        *this,
-        "yaw_pid",
-        drone_node::algorithm::PIDLimitMode::PER_AXIS);
+    load_controller_configs();
 
     // Validate parameters without retaining an execution object in IDLE.
     {
@@ -394,6 +402,25 @@ void FlightController::trajectory_callback(
         return;
     }
 
+    if (msg->controller_id != "position_yaw_pid") {
+        RCLCPP_WARN(
+            get_logger(),
+            "Trajectory rejected: unknown controller");
+        return;
+    }
+
+    const auto selected = controller_configs_.find(msg->config_name);
+
+    if (selected == controller_configs_.end()) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Trajectory rejected: unknown configuration '%s'",
+            msg->config_name.c_str());
+        return;
+    }
+
+    const auto pending_config = selected->second;
+
     try {
         drone_node::TrajectoryManager pending_trajectory;
         const drone_node::SteadyTime preparation_origin{};
@@ -412,7 +439,6 @@ void FlightController::trajectory_callback(
             return;
         }
 
-        // Read feedback after potentially expensive trajectory preparation.
         const auto state = state_cache_->snapshot(SteadyClock::now());
 
         if (!drone_node::StateCache::usable(state)) {
@@ -424,7 +450,7 @@ void FlightController::trajectory_callback(
 
         auto pending_controller =
             drone_node::controller::ControllerFactory::create(
-                msg->controller_id, controller_config_);
+                msg->controller_id, pending_config);
 
         pending_controller->initialize(
             make_input(
@@ -440,15 +466,18 @@ void FlightController::trajectory_callback(
 
         trajectory_manager_ = std::move(pending_trajectory);
         controller_ = std::move(pending_controller);
+        controller_config_ = pending_config;
 
         fault_code_ = ControlStatus::FAULT_NONE;
         change_control_state(ControlStatus::TRACKING);
 
         RCLCPP_INFO(
             get_logger(),
-            "Trajectory %lu accepted",
+            "Trajectory %lu accepted: controller=%s config=%s",
             static_cast<unsigned long>(
-                trajectory_manager_.trajectory_id()));
+                trajectory_manager_.trajectory_id()),
+            msg->controller_id.c_str(),
+            msg->config_name.c_str());
     } catch (const std::exception& e) {
         RCLCPP_WARN(
             get_logger(),
@@ -632,4 +661,61 @@ void FlightController::status_loop()
         : std::numeric_limits<double>::quiet_NaN();
 
     control_status_pub_->publish(status);
+}
+
+void FlightController::load_controller_configs()
+{
+    const auto names =
+        declare_parameter<std::vector<std::string>>(
+            "controllers.position_yaw_pid.config_names",
+            std::vector<std::string>{"default"});
+
+    if (names.empty()) {
+        throw std::invalid_argument(
+            "No position_yaw_pid configurations defined");
+    }
+
+    for (const auto& name : names) {
+        if (name.empty() || name.find('.') != std::string::npos) {
+            throw std::invalid_argument(
+                "Configuration names must be nonempty and contain no dots");
+        }
+
+        if (controller_configs_.find(name) != controller_configs_.end()) {
+            throw std::invalid_argument(
+                "Duplicate controller configuration: " + name);
+        }
+
+        const std::string prefix =
+            "controllers.position_yaw_pid.configs." + name;
+
+        drone_node::controller::PositionYawPIDConfig config;
+
+        config.position = load_pid_parameters(
+            *this,
+            prefix + ".position_pid",
+            drone_node::algorithm::PIDLimitMode::NORM);
+
+        config.yaw = load_pid_parameters(
+            *this,
+            prefix + ".yaw_pid",
+            drone_node::algorithm::PIDLimitMode::PER_AXIS);
+
+        // Validate every profile during startup.
+        auto checked =
+            drone_node::controller::ControllerFactory::create(
+                "position_yaw_pid", config);
+        (void)checked;
+
+        controller_configs_.emplace(name, config);
+    }
+
+    const auto default_config = controller_configs_.find("default");
+
+    if (default_config == controller_configs_.end()) {
+        throw std::invalid_argument(
+            "The default controller configuration is required");
+    }
+
+    controller_config_ = default_config->second;
 }
