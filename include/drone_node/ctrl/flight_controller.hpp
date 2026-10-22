@@ -1,13 +1,10 @@
 #pragma once
 
-#include <array>
-#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
 
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/bool.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <geometry_msgs/msg/quaternion_stamped.hpp>
@@ -16,12 +13,11 @@
 #include "drone_node/msg/control_trajectory.hpp"
 #include "drone_node/msg/control_status.hpp"
 #include "drone_node/msg/control_command.hpp"
-#include "drone_node/msg/fixed_trajectory.hpp"
 
 #include "drone_node/ctrl/controller/controller_factory.hpp"
 #include "drone_node/ctrl/trajectory_manager.hpp"
-#include "drone_node/ctrl/trajectory_sampler/fixed_sampler.hpp"
-#include "drone_node/types.hpp"
+#include "drone_node/ctrl/state_cache.hpp"
+#include "drone_node/ctrl/hover_reference.hpp"
 
 class FlightController : public rclcpp::Node
 {
@@ -37,16 +33,7 @@ private:
     using ControlTrajectory = drone_node::msg::ControlTrajectory;
     using ControlStatus = drone_node::msg::ControlStatus;
     using ControlCommand = drone_node::msg::ControlCommand;
-    using FixedTrajectory = drone_node::msg::FixedTrajectory;
-    using PointSampler = drone_node::trajectory_sampler::PointSampler;
-    using SteadyClock = std::chrono::steady_clock;
-
-    struct Feedback
-    {
-        geometry_msgs::msg::Point position;
-        geometry_msgs::msg::Vector3 velocity;
-        geometry_msgs::msg::Quaternion orientation;
-    };
+    using SteadyClock = drone_node::SteadyClock;
 
     void position_callback(const PointStamped::SharedPtr msg);
     void velocity_callback(const VectorStamped::SharedPtr msg);
@@ -54,14 +41,10 @@ private:
     void trajectory_callback(const ControlTrajectory::SharedPtr msg);
     void command_callback(const ControlCommand::SharedPtr msg);
 
-    // Removed later in the FSM migration stage.
-    void output_enable_callback(
-        const std_msgs::msg::Bool::SharedPtr msg);
-    void armed_callback(
-        const std_msgs::msg::Bool::SharedPtr msg);
-
     void control_loop();
+    void run_control_cycle();
     void status_loop();
+    void set_control_timer(double frequency);
 
     void publish_velocity_setpoint(
         const Eigen::Vector3d& velocity,
@@ -71,60 +54,33 @@ private:
     void enter_hover();
     void enter_idle();
     void enter_fault(uint16_t fault_code);
-    void reset_control_runtime();
+    void clear_execution();
 
-    FixedTrajectory make_current_fixed_reference() const;
-
-    drone_node::PhysicalControllerInput make_controller_input(
-        const drone_node::ReferenceState& reference,
-        double dt) const;
-
-    bool state_is_fresh() const;
-
-    // Feedback estimation moves to StateCache in its migration stage.
-    static double wrap_pi(double angle);
-    static double yaw_from_quaternion(
-        const geometry_msgs::msg::Quaternion& q);
-    void update_unwrapped_yaw(double measured_yaw);
-
-    double control_frequency_{50.0};
+    double control_frequency_{100.0};
+    double active_control_frequency_{100.0};
     double status_frequency_{10.0};
     double state_timeout_{0.2};
 
-    bool enable_setpoint_stream_{false};
+    unsigned consecutive_overruns_{0};
 
     drone_node::controller::PositionYawPIDConfig controller_config_{};
+    drone_node::HoverReference::Config hover_config_{};
+
+    std::unique_ptr<drone_node::StateCache> state_cache_;
     std::unique_ptr<drone_node::controller::ControllerBase> controller_;
-    bool controller_initialized_{false};
+    std::unique_ptr<drone_node::HoverReference> hover_reference_;
 
     drone_node::TrajectoryManager trajectory_manager_;
-    std::unique_ptr<PointSampler> hover_sampler_;
-
-    Feedback latest_vehicle_state_{};
-    std::array<bool, 3> feedback_received_{};
-    std::array<SteadyClock::time_point, 3> feedback_time_{};
-
-    bool armed_{false};
-    bool has_armed_feedback_{false};
-
-    bool has_yaw_measurement_{false};
-    double previous_wrapped_yaw_{0.0};
-    double unwrapped_yaw_{0.0};
-    double measured_yaw_rate_{0.0};
-    SteadyClock::time_point last_yaw_receive_time_{};
 
     uint8_t control_state_{ControlStatus::IDLE};
     uint16_t fault_code_{ControlStatus::FAULT_NONE};
-
-    drone_node::ReferenceState latest_reference_{};
-    bool has_reference_{false};
 
     double position_error_{
         std::numeric_limits<double>::quiet_NaN()};
     double yaw_error_{
         std::numeric_limits<double>::quiet_NaN()};
 
-    SteadyClock::time_point last_control_time_{};
+    drone_node::SteadyTime last_control_time_{};
     bool has_last_control_time_{false};
 
     rclcpp::Subscription<PointStamped>::SharedPtr position_sub_;
@@ -133,10 +89,7 @@ private:
     rclcpp::Subscription<ControlTrajectory>::SharedPtr trajectory_sub_;
     rclcpp::Subscription<ControlCommand>::SharedPtr command_sub_;
 
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr output_enable_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr armed_sub_;
-
-    rclcpp::Publisher<Setpoint>::SharedPtr trajectory_setpoint_pub_;
+    rclcpp::Publisher<Setpoint>::SharedPtr setpoint_pub_;
     rclcpp::Publisher<ControlStatus>::SharedPtr control_status_pub_;
 
     rclcpp::TimerBase::SharedPtr control_timer_;

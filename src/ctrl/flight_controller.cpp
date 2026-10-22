@@ -1,7 +1,7 @@
-
 #include "drone_node/ctrl/flight_controller.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -9,45 +9,78 @@
 #include <string>
 #include <utility>
 
-
 namespace
 {
+
+constexpr double RAD_TO_DEG =
+    180.0 / 3.14159265358979323846;
+
+bool positive(double value)
+{
+    return std::isfinite(value) && value > 0.0;
+}
+
+std::chrono::nanoseconds timer_period(double frequency)
+{
+    if (!positive(frequency)) {
+        throw std::invalid_argument("Invalid timer frequency");
+    }
+
+    const double nanoseconds = 1e9 / frequency;
+
+    if (!std::isfinite(nanoseconds) ||
+        nanoseconds < 1.0 ||
+        nanoseconds >= static_cast<double>(
+            std::numeric_limits<int64_t>::max())) {
+        throw std::invalid_argument(
+            "Timer period is outside the supported range");
+    }
+
+    return std::chrono::nanoseconds(
+        static_cast<int64_t>(std::ceil(nanoseconds)));
+}
 
 drone_node::algorithm::PIDParameters load_pid_parameters(
     rclcpp::Node& node,
     const std::string& prefix,
-    drone_node::algorithm::PIDLimitMode limit_mode)
+    drone_node::algorithm::PIDLimitMode mode)
 {
-    drone_node::algorithm::PIDParameters params;
+    drone_node::algorithm::PIDParameters parameters;
 
-    params.kp = node.declare_parameter<double>(
-        prefix + ".kp", params.kp);
+    parameters.kp = node.declare_parameter<double>(
+        prefix + ".kp", parameters.kp);
+    parameters.ki = node.declare_parameter<double>(
+        prefix + ".ki", parameters.ki);
+    parameters.kd = node.declare_parameter<double>(
+        prefix + ".kd", parameters.kd);
 
-    params.ki = node.declare_parameter<double>(
-        prefix + ".ki", params.ki);
+    parameters.max_output = node.declare_parameter<double>(
+        prefix + ".max_output", parameters.max_output);
 
-    params.kd = node.declare_parameter<double>(
-        prefix + ".kd", params.kd);
-
-    params.max_output = node.declare_parameter<double>(
-        prefix + ".max_output", params.max_output);
-
-    params.max_output_rate = node.declare_parameter<double>(
+    parameters.max_output_rate = node.declare_parameter<double>(
         prefix + ".max_output_rate",
-        params.max_output_rate);
+        parameters.max_output_rate);
 
-    params.integral_limit = node.declare_parameter<double>(
+    parameters.integral_limit = node.declare_parameter<double>(
         prefix + ".integral_limit",
-        params.integral_limit);
+        parameters.integral_limit);
 
-    params.limit_mode = limit_mode;
-    return params;
+    parameters.limit_mode = mode;
+    return parameters;
 }
 
-constexpr double PI = 3.14159265358979323846;
-constexpr double TWO_PI = 2.0 * PI;
-constexpr double RAD_TO_DEG = 180.0 / PI;
-constexpr double ANGLE_EPS = 1e-10;
+drone_node::PhysicalControllerInput make_input(
+    const drone_node::StateSnapshot& state,
+    const drone_node::ReferenceState& reference,
+    double dt)
+{
+    drone_node::PhysicalControllerInput input;
+    input.state = state;
+    input.reference = reference;
+    input.reference_validity = {true, true, true, true, true};
+    input.dt = dt;
+    return input;
+}
 
 }  // namespace
 
@@ -56,355 +89,161 @@ FlightController::FlightController(
     : Node("flight_controller", options)
 {
     control_frequency_ = declare_parameter<double>(
-        "control_frequency", 50.0);
-
+        "control_frequency", 100.0);
     status_frequency_ = declare_parameter<double>(
         "status_frequency", 10.0);
-
     state_timeout_ = declare_parameter<double>(
         "state_timeout", 0.2);
 
-    enable_setpoint_stream_ = declare_parameter<bool>(
-        "enable_setpoint_stream", false);
-
-    const auto positive = [](double value) {
-        return std::isfinite(value) && value > 0.0;
-    };
+    hover_config_.speed_threshold = declare_parameter<double>(
+        "hover.speed_threshold", 0.1);
+    hover_config_.yaw_rate_threshold = declare_parameter<double>(
+        "hover.yaw_rate_threshold", 0.1);
+    hover_config_.settle_duration = declare_parameter<double>(
+        "hover.settle_duration", 0.3);
 
     if (!positive(control_frequency_) ||
         !positive(status_frequency_) ||
+        status_frequency_ > 20.0 ||
         !positive(state_timeout_)) {
-        throw std::runtime_error(
-            "Invalid FlightController parameters");
+        throw std::invalid_argument(
+            "Invalid scheduling or timeout parameters");
     }
 
-    const auto position_pid_params = load_pid_parameters(
+    controller_config_.position = load_pid_parameters(
         *this,
         "position_pid",
         drone_node::algorithm::PIDLimitMode::NORM);
 
-    const auto yaw_pid_params = load_pid_parameters(
+    controller_config_.yaw = load_pid_parameters(
         *this,
         "yaw_pid",
         drone_node::algorithm::PIDLimitMode::PER_AXIS);
 
-    controller_config_.position = position_pid_params;
-    controller_config_.yaw = yaw_pid_params;
+    // Validate parameters without retaining an execution object in IDLE.
+    {
+        auto checked_controller =
+            drone_node::controller::ControllerFactory::create(
+                "position_yaw_pid", controller_config_);
+        const drone_node::HoverReference checked_hover(hover_config_);
+        (void)checked_controller;
+        (void)checked_hover;
+    }
 
-    controller_ = drone_node::controller::ControllerFactory::create(
-        "position_yaw_pid", controller_config_);
-
-    RCLCPP_INFO(
-        get_logger(),
-        "Position PID: kp=%.3f ki=%.3f kd=%.3f "
-        "max_output=%.3f max_output_rate=%.3f",
-        position_pid_params.kp,
-        position_pid_params.ki,
-        position_pid_params.kd,
-        position_pid_params.max_output,
-        position_pid_params.max_output_rate);
-
-    RCLCPP_INFO(
-        get_logger(),
-        "Yaw PID: kp=%.3f ki=%.3f kd=%.3f "
-        "max_output=%.3f max_output_rate=%.3f",
-        yaw_pid_params.kp,
-        yaw_pid_params.ki,
-        yaw_pid_params.kd,
-        yaw_pid_params.max_output,
-        yaw_pid_params.max_output_rate);
+    state_cache_ =
+        std::make_unique<drone_node::StateCache>(state_timeout_);
 
     const auto feedback_qos = rclcpp::QoS(1).reliable();
 
     position_sub_ = create_subscription<PointStamped>(
-        "/px4_interface/out/position", feedback_qos,
-        std::bind(&FlightController::position_callback,
-                this, std::placeholders::_1));
+        "/px4_interface/out/position",
+        feedback_qos,
+        std::bind(
+            &FlightController::position_callback,
+            this, std::placeholders::_1));
 
     velocity_sub_ = create_subscription<VectorStamped>(
-        "/px4_interface/out/velocity", feedback_qos,
-        std::bind(&FlightController::velocity_callback,
-                this, std::placeholders::_1));
+        "/px4_interface/out/velocity",
+        feedback_qos,
+        std::bind(
+            &FlightController::velocity_callback,
+            this, std::placeholders::_1));
 
     attitude_sub_ = create_subscription<QuaternionStamped>(
-        "/px4_interface/out/attitude", feedback_qos,
-        std::bind(&FlightController::attitude_callback,
-                this, std::placeholders::_1));
+        "/px4_interface/out/attitude",
+        feedback_qos,
+        std::bind(
+            &FlightController::attitude_callback,
+            this, std::placeholders::_1));
 
-    trajectory_sub_ =
-        create_subscription<ControlTrajectory>(
-            "/flight_controller/in/trajectory",
-            rclcpp::QoS(1).reliable(),
-            std::bind(
-                &FlightController::trajectory_callback,
-                this,
-                std::placeholders::_1));
+    trajectory_sub_ = create_subscription<ControlTrajectory>(
+        "/flight_controller/in/trajectory",
+        rclcpp::QoS(1).reliable(),
+        std::bind(
+            &FlightController::trajectory_callback,
+            this, std::placeholders::_1));
 
-    command_sub_ =
-        create_subscription<ControlCommand>(
-            "/flight_controller/in/command",
-            rclcpp::QoS(10).reliable(),
-            std::bind(
-                &FlightController::command_callback,
-                this,
-                std::placeholders::_1));
+    command_sub_ = create_subscription<ControlCommand>(
+        "/flight_controller/in/command",
+        rclcpp::QoS(10).reliable(),
+        std::bind(
+            &FlightController::command_callback,
+            this, std::placeholders::_1));
 
-    output_enable_sub_ =
-        create_subscription<std_msgs::msg::Bool>(
-            "/flight_controller/in/enable_setpoint_stream",
-            rclcpp::QoS(10).reliable(),
-            std::bind(
-                &FlightController::output_enable_callback,
-                this,
-                std::placeholders::_1));
+    setpoint_pub_ = create_publisher<Setpoint>(
+        "/px4_interface/in/setpoint",
+        rclcpp::QoS(1).reliable());
 
-    armed_sub_ =
-        create_subscription<std_msgs::msg::Bool>(
-            "/px4_interface/out/arm",
-            rclcpp::QoS(10),
-            std::bind(
-                &FlightController::armed_callback,
-                this,
-                std::placeholders::_1));
+    control_status_pub_ = create_publisher<ControlStatus>(
+        "/flight_controller/out/control_status",
+        rclcpp::QoS(10).reliable());
 
-    trajectory_setpoint_pub_ = create_publisher<Setpoint>(
-        "/px4_interface/in/setpoint", rclcpp::QoS(1).reliable());
-
-    control_status_pub_ =
-        create_publisher<ControlStatus>(
-            "/flight_controller/out/control_status",
-            rclcpp::QoS(10).reliable());
-
-    const auto control_period =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::duration<double>(
-                1.0 / control_frequency_));
-
-    const auto status_period =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::duration<double>(
-                1.0 / status_frequency_));
-
-    control_timer_ = create_wall_timer(
-        control_period,
-        std::bind(&FlightController::control_loop, this));
+    set_control_timer(control_frequency_);
 
     status_timer_ = create_wall_timer(
-        status_period,
+        timer_period(status_frequency_),
         std::bind(&FlightController::status_loop, this));
 
     RCLCPP_INFO(
         get_logger(),
         "FlightController started: control=%.1f Hz, "
-        "status=%.1f Hz, state=IDLE, output=%s",
-        control_frequency_,
-        status_frequency_,
-        enable_setpoint_stream_ ? "enabled" : "disabled");
+        "status=%.1f Hz, state=IDLE",
+        active_control_frequency_,
+        status_frequency_);
 }
 
-double FlightController::wrap_pi(double angle)
+void FlightController::set_control_timer(double frequency)
 {
-    double result = std::remainder(angle, TWO_PI);
+    const auto period = timer_period(frequency);
 
-    if (result <= -PI) {
-        result += TWO_PI;
+    auto next_timer = create_wall_timer(
+        period,
+        std::bind(&FlightController::control_loop, this));
+
+    if (control_timer_) {
+        control_timer_->cancel();
     }
 
-    return result;
+    control_timer_ = std::move(next_timer);
+    active_control_frequency_ = frequency;
+    consecutive_overruns_ = 0;
 }
 
-double FlightController::yaw_from_quaternion(
-    const geometry_msgs::msg::Quaternion& q)
+void FlightController::position_callback(
+    const PointStamped::SharedPtr msg)
 {
-    const double norm_squared =
-        q.w * q.w + q.x * q.x +
-        q.y * q.y + q.z * q.z;
+    const auto& p = msg->point;
 
-    const double siny =
-        2.0 * (q.w * q.z + q.x * q.y) /
-        norm_squared;
-
-    const double cosy =
-        1.0 -
-        2.0 * (q.y * q.y + q.z * q.z) /
-        norm_squared;
-
-    return std::atan2(siny, cosy);
+    state_cache_->update_position(
+        Eigen::Vector3d(p.x, p.y, p.z),
+        SteadyClock::now());
 }
 
-void FlightController::update_unwrapped_yaw(
-    double measured_yaw)
+void FlightController::velocity_callback(
+    const VectorStamped::SharedPtr msg)
 {
-    const auto receive_time = SteadyClock::now();
+    const auto& v = msg->vector;
 
-    if (!has_yaw_measurement_) {
-        previous_wrapped_yaw_ = measured_yaw;
-        unwrapped_yaw_ = measured_yaw;
-        measured_yaw_rate_ = 0.0;
-        last_yaw_receive_time_ = receive_time;
-        has_yaw_measurement_ = true;
-        return;
+    state_cache_->update_velocity(
+        Eigen::Vector3d(v.x, v.y, v.z),
+        SteadyClock::now());
+}
+
+void FlightController::attitude_callback(
+    const QuaternionStamped::SharedPtr msg)
+{
+    const auto& q = msg->quaternion;
+
+    const auto result = state_cache_->update_attitude(
+        Eigen::Quaterniond(q.w, q.x, q.y, q.z),
+        SteadyClock::now());
+
+    if (result ==
+            drone_node::StateCache::AttitudeResult::YAW_DISCONTINUITY &&
+        (control_state_ == ControlStatus::TRACKING ||
+         control_state_ == ControlStatus::HOVER)) {
+        enter_fault(ControlStatus::FAULT_INVALID_STATE);
     }
-
-    const double dt =
-        std::chrono::duration<double>(
-            receive_time - last_yaw_receive_time_).count();
-
-    if (dt <= 0.0) {
-        return;
-    }
-
-    const double delta =
-        wrap_pi(measured_yaw - previous_wrapped_yaw_);
-
-    if (dt > state_timeout_ ||
-        std::abs(delta) >= PI - ANGLE_EPS) {
-
-        has_yaw_measurement_ = false;
-        measured_yaw_rate_ = 0.0;
-
-        if (control_state_ == ControlStatus::TRACKING ||
-            control_state_ == ControlStatus::HOVER) {
-            enter_fault(ControlStatus::FAULT_INVALID_STATE);
-        }
-
-        return;
-    }
-
-    unwrapped_yaw_ += delta;
-    measured_yaw_rate_ = delta / dt;
-
-    previous_wrapped_yaw_ = measured_yaw;
-    last_yaw_receive_time_ = receive_time;
-}
-
-void FlightController::position_callback(const PointStamped::SharedPtr msg)
-{
-    const auto &p = msg->point;
-    if (!std::isfinite(p.x) ||
-        !std::isfinite(p.y) ||
-        !std::isfinite(p.z))
-        return;
-
-    latest_vehicle_state_.position = p;
-    feedback_received_[0] = true;
-    feedback_time_[0] = SteadyClock::now();
-}
-
-void FlightController::velocity_callback(const VectorStamped::SharedPtr msg)
-{
-    const auto &v = msg->vector;
-    if (!std::isfinite(v.x) ||
-        !std::isfinite(v.y) ||
-        !std::isfinite(v.z))
-        return;
-
-    latest_vehicle_state_.velocity = v;
-    feedback_received_[1] = true;
-    feedback_time_[1] = SteadyClock::now();
-}
-
-void FlightController::attitude_callback(const QuaternionStamped::SharedPtr msg)
-{
-    auto q = msg->quaternion;
-    const double norm2 =
-        q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
-    if (!std::isfinite(norm2) || norm2 <= 1e-12)
-        return;
-
-    const double norm = std::sqrt(norm2);
-    q.w /= norm;
-    q.x /= norm;
-    q.y /= norm;
-    q.z /= norm;
-
-    latest_vehicle_state_.orientation = q;
-    feedback_received_[2] = true;
-    feedback_time_[2] = SteadyClock::now();
-    update_unwrapped_yaw(yaw_from_quaternion(q));
-}
-
-bool FlightController::state_is_fresh() const
-{
-    if (!has_yaw_measurement_)
-        return false;
-
-    const auto now = SteadyClock::now();
-    for (size_t i = 0; i < feedback_received_.size(); ++i) {
-        if (!feedback_received_[i] ||
-            std::chrono::duration<double>(
-                now - feedback_time_[i]).count() > state_timeout_)
-            return false;
-    }
-    return true;
-}
-
-FlightController::FixedTrajectory
-FlightController::make_current_fixed_reference() const
-{
-    if (!state_is_fresh()) {
-        throw std::runtime_error(
-            "Cannot create fixed reference: stale vehicle state");
-    }
-
-    FixedTrajectory fixed{};
-
-    fixed.position = latest_vehicle_state_.position;
-    fixed.yaw = yaw_from_quaternion(
-        latest_vehicle_state_.orientation);
-
-    fixed.yaw_direction = FixedTrajectory::SHORTEST;
-
-    return fixed;
-}
-
-void FlightController::reset_control_runtime()
-{
-    if (controller_) {
-        controller_->reset();
-    }
-
-    controller_initialized_ = false;
-    has_last_control_time_ = false;
-    has_reference_ = false;
-
-    position_error_ = std::numeric_limits<double>::quiet_NaN();
-    yaw_error_ = std::numeric_limits<double>::quiet_NaN();
-}
-
-drone_node::PhysicalControllerInput
-FlightController::make_controller_input(
-    const drone_node::ReferenceState& reference,
-    double dt) const
-{
-    drone_node::PhysicalControllerInput input;
-    input.reference = reference;
-    input.reference_validity = {true, true, true, true, true};
-    input.dt = dt;
-
-    auto& state = input.state;
-    state.captured_at = SteadyClock::now();
-
-    const auto& p = latest_vehicle_state_.position;
-    const auto& v = latest_vehicle_state_.velocity;
-    const auto& q = latest_vehicle_state_.orientation;
-
-    state.position = Eigen::Vector3d(p.x, p.y, p.z);
-    state.velocity = Eigen::Vector3d(v.x, v.y, v.z);
-    state.orientation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
-
-    state.position_feedback = {
-        feedback_received_[0], feedback_time_[0]};
-    state.velocity_feedback = {
-        feedback_received_[1], feedback_time_[1]};
-    state.attitude_feedback = {
-        feedback_received_[2], feedback_time_[2]};
-
-    state.unwrapped_yaw = unwrapped_yaw_;
-    state.measured_yaw_rate = measured_yaw_rate_;
-    state.yaw_valid = has_yaw_measurement_;
-
-    return input;
 }
 
 void FlightController::change_control_state(uint8_t state)
@@ -423,43 +262,21 @@ void FlightController::change_control_state(uint8_t state)
         static_cast<unsigned>(state));
 }
 
-void FlightController::enter_hover()
+void FlightController::clear_execution()
 {
-    if (control_state_ != ControlStatus::TRACKING) {
-        throw std::logic_error(
-            "HOVER is only reachable from TRACKING");
-    }
-
-    // Capture the actual pose once. Do not update it each cycle.
-    auto new_sampler = std::make_unique<PointSampler>(
-        make_current_fixed_reference());
-
-    hover_sampler_ = std::move(new_sampler);
     trajectory_manager_.clear();
+    hover_reference_.reset();
+    controller_.reset();
 
-    reset_control_runtime();
-
-    fault_code_ = ControlStatus::FAULT_NONE;
-    change_control_state(ControlStatus::HOVER);
-
-    RCLCPP_INFO(
-        get_logger(),
-        "Entered HOVER at x=%.3f y=%.3f z=%.3f",
-        latest_vehicle_state_.position.x,
-        latest_vehicle_state_.position.y,
-        latest_vehicle_state_.position.z);
+    has_last_control_time_ = false;
+    position_error_ = std::numeric_limits<double>::quiet_NaN();
+    yaw_error_ = std::numeric_limits<double>::quiet_NaN();
 }
 
 void FlightController::enter_idle()
 {
-    trajectory_manager_.clear();
-    hover_sampler_.reset();
-
-    reset_control_runtime();
-
-    enable_setpoint_stream_ = false;
+    clear_execution();
     fault_code_ = ControlStatus::FAULT_NONE;
-
     change_control_state(ControlStatus::IDLE);
 }
 
@@ -469,66 +286,62 @@ void FlightController::enter_fault(uint16_t fault_code)
         return;
     }
 
+    clear_execution();
     fault_code_ = fault_code;
-
-    trajectory_manager_.clear();
-    hover_sampler_.reset();
-
-    reset_control_runtime();
-    enable_setpoint_stream_ = false;
-
     change_control_state(ControlStatus::FAULT);
 
     RCLCPP_ERROR(
         get_logger(),
         "FlightController fault: %u",
-        static_cast<unsigned>(fault_code));
+        static_cast<unsigned>(fault_code_));
 }
 
-void FlightController::armed_callback(
-    const std_msgs::msg::Bool::SharedPtr msg)
+void FlightController::enter_hover()
 {
-    armed_ = msg->data;
-    has_armed_feedback_ = true;
-}
-
-void FlightController::output_enable_callback(
-    const std_msgs::msg::Bool::SharedPtr msg)
-{
-    if (msg->data &&
-        (control_state_ == ControlStatus::IDLE ||
-         control_state_ == ControlStatus::FAULT)) {
-
-        RCLCPP_WARN(
-            get_logger(),
-            "Cannot enable output in IDLE or FAULT");
-        return;
+    if (control_state_ != ControlStatus::TRACKING) {
+        throw std::logic_error(
+            "HOVER is only reachable from TRACKING");
     }
 
-    if (enable_setpoint_stream_ == msg->data) {
-        return;
+    const auto state = state_cache_->snapshot(SteadyClock::now());
+
+    if (!drone_node::StateCache::usable(state)) {
+        throw std::runtime_error(
+            "CANCEL requires fresh feedback");
     }
 
-    enable_setpoint_stream_ = msg->data;
-    reset_control_runtime();
+    auto pending_hover =
+        std::make_unique<drone_node::HoverReference>(hover_config_);
+    pending_hover->start(state);
 
-    RCLCPP_INFO(
-        get_logger(),
-        "Setpoint output %s",
-        enable_setpoint_stream_ ? "enabled" : "disabled");
+    auto pending_controller =
+        drone_node::controller::ControllerFactory::create(
+            "position_yaw_pid", controller_config_);
+
+    pending_controller->initialize(
+        make_input(
+            state,
+            pending_hover->sample(state),
+            1.0 / active_control_frequency_),
+        drone_node::controller::YawDirection::SHORTEST);
+
+    clear_execution();
+
+    hover_reference_ = std::move(pending_hover);
+    controller_ = std::move(pending_controller);
+
+    fault_code_ = ControlStatus::FAULT_NONE;
+    change_control_state(ControlStatus::HOVER);
 }
 
 void FlightController::command_callback(
     const ControlCommand::SharedPtr msg)
 {
     switch (msg->command) {
-
     case ControlCommand::CANCEL:
-    {
         if (control_state_ != ControlStatus::TRACKING) {
             RCLCPP_WARN(
-                get_logger(),
-                "CANCEL rejected: not TRACKING");
+                get_logger(), "CANCEL rejected: not TRACKING");
             return;
         }
 
@@ -536,54 +349,31 @@ void FlightController::command_callback(
             enter_hover();
         } catch (const std::exception& e) {
             RCLCPP_ERROR(
-                get_logger(),
-                "CANCEL failed: %s",
-                e.what());
-
+                get_logger(), "CANCEL failed: %s", e.what());
             enter_fault(ControlStatus::FAULT_INVALID_STATE);
         }
         return;
-    }
 
     case ControlCommand::EXIT_IDLE:
-    {
+        // Preserve the existing TRACKING-only command constraint.
         if (control_state_ != ControlStatus::TRACKING) {
             RCLCPP_WARN(
-                get_logger(),
-                "EXIT_IDLE rejected: not TRACKING");
-            return;
-        }
-
-        if (!has_armed_feedback_ || armed_) {
-            RCLCPP_WARN(
-                get_logger(),
-                "EXIT_IDLE rejected: disarm not confirmed");
+                get_logger(), "EXIT_IDLE rejected: not TRACKING");
             return;
         }
 
         enter_idle();
         return;
-    }
 
     case ControlCommand::RESET_FAULT:
-    {
         if (control_state_ != ControlStatus::FAULT) {
             RCLCPP_WARN(
-                get_logger(),
-                "RESET_FAULT rejected: not FAULT");
-            return;
-        }
-
-        if (!has_armed_feedback_ || armed_) {
-            RCLCPP_WARN(
-                get_logger(),
-                "RESET_FAULT rejected: disarm not confirmed");
+                get_logger(), "RESET_FAULT rejected: not FAULT");
             return;
         }
 
         enter_idle();
         return;
-    }
 
     default:
         RCLCPP_WARN(
@@ -604,16 +394,7 @@ void FlightController::trajectory_callback(
         return;
     }
 
-    if (!state_is_fresh()) {
-        RCLCPP_WARN(
-            get_logger(),
-            "Trajectory rejected: no fresh vehicle state");
-        return;
-    }
-
     try {
-        // Prepare everything in local objects.
-        // Failure must leave the active trajectory/controller intact.
         drone_node::TrajectoryManager pending_trajectory;
         const drone_node::SteadyTime preparation_origin{};
 
@@ -631,31 +412,34 @@ void FlightController::trajectory_callback(
             return;
         }
 
-        const auto initial_reference =
-            pending_trajectory.sample(preparation_origin);
+        // Read feedback after potentially expensive trajectory preparation.
+        const auto state = state_cache_->snapshot(SteadyClock::now());
 
-        const auto input = make_controller_input(
-            initial_reference,
-            1.0 / control_frequency_);
+        if (!drone_node::StateCache::usable(state)) {
+            RCLCPP_WARN(
+                get_logger(),
+                "Trajectory rejected: no fresh vehicle state");
+            return;
+        }
 
         auto pending_controller =
             drone_node::controller::ControllerFactory::create(
                 msg->controller_id, controller_config_);
 
         pending_controller->initialize(
-            input,
+            make_input(
+                state,
+                pending_trajectory.sample(preparation_origin),
+                1.0 / active_control_frequency_),
             static_cast<drone_node::controller::YawDirection>(
                 pending_trajectory.yaw_direction()));
 
-        // Start the clock only after preparation has succeeded.
         pending_trajectory.activate(SteadyClock::now());
 
-        reset_control_runtime();
+        clear_execution();
 
         trajectory_manager_ = std::move(pending_trajectory);
         controller_ = std::move(pending_controller);
-        controller_initialized_ = true;
-        hover_sampler_.reset();
 
         fault_code_ = ControlStatus::FAULT_NONE;
         change_control_state(ControlStatus::TRACKING);
@@ -677,6 +461,16 @@ void FlightController::publish_velocity_setpoint(
     const Eigen::Vector3d& velocity,
     double yaw_rate)
 {
+    const double degrees_per_second = yaw_rate * RAD_TO_DEG;
+
+    if (!velocity.allFinite() ||
+        !std::isfinite(degrees_per_second) ||
+        std::abs(degrees_per_second) >
+            std::numeric_limits<float>::max()) {
+        throw std::runtime_error(
+            "Setpoint is outside the message numeric range");
+    }
+
     Setpoint setpoint{};
     setpoint.stamp = now();
     setpoint.control_mode = Setpoint::VELOCITY;
@@ -684,44 +478,42 @@ void FlightController::publish_velocity_setpoint(
     setpoint.velocity.x = velocity.x();
     setpoint.velocity.y = velocity.y();
     setpoint.velocity.z = velocity.z();
-
-    // Internal rad/s -> ROS message deg/s.
     setpoint.yawspeed =
-        static_cast<float>(yaw_rate * RAD_TO_DEG);
+        static_cast<float>(degrees_per_second);
 
-    trajectory_setpoint_pub_->publish(setpoint);
+    setpoint_pub_->publish(setpoint);
 }
 
-void FlightController::control_loop()
+void FlightController::run_control_cycle()
 {
-    if (control_state_ == ControlStatus::IDLE ||
-        control_state_ == ControlStatus::FAULT) {
+    if (control_state_ != ControlStatus::TRACKING &&
+        control_state_ != ControlStatus::HOVER) {
         return;
     }
 
-    // Removed in the FSM migration stage.
-    if (!enable_setpoint_stream_) {
-        return;
-    }
+    const auto cycle_time = SteadyClock::now();
 
-    const auto steady_now = SteadyClock::now();
+    // Exactly one feedback snapshot for this control cycle.
+    const auto state = state_cache_->snapshot(cycle_time);
 
-    if (!state_is_fresh()) {
+    if (!drone_node::StateCache::usable(state)) {
         enter_fault(ControlStatus::FAULT_STATE_TIMEOUT);
         return;
     }
 
-    double dt = 1.0 / control_frequency_;
+    double dt = 1.0 / active_control_frequency_;
 
     if (has_last_control_time_) {
         dt = std::chrono::duration<double>(
-            steady_now - last_control_time_).count();
+            cycle_time - last_control_time_).count();
 
         dt = std::clamp(
-            dt, 0.001, 2.0 / control_frequency_);
+            dt,
+            std::min(0.001, 1.0 / active_control_frequency_),
+            2.0 / active_control_frequency_);
     }
 
-    last_control_time_ = steady_now;
+    last_control_time_ = cycle_time;
     has_last_control_time_ = true;
 
     try {
@@ -730,41 +522,21 @@ void FlightController::control_loop()
                 "Missing physical controller");
         }
 
-        auto direction =
-            drone_node::controller::YawDirection::SHORTEST;
+        drone_node::ReferenceState reference;
 
         if (control_state_ == ControlStatus::TRACKING) {
-            if (!trajectory_manager_.has_trajectory()) {
-                throw std::runtime_error(
-                    "TRACKING without an active trajectory");
-            }
-
-            latest_reference_ = trajectory_manager_.sample(steady_now);
-            direction =
-                static_cast<drone_node::controller::YawDirection>(
-                    trajectory_manager_.yaw_direction());
-        } else if (control_state_ == ControlStatus::HOVER) {
-            if (!hover_sampler_) {
-                throw std::runtime_error(
-                    "HOVER without reference sampler");
-            }
-
-            latest_reference_ = hover_sampler_->sample(0.0);
+            reference = trajectory_manager_.sample(cycle_time);
         } else {
-            return;
+            if (!hover_reference_) {
+                throw std::runtime_error(
+                    "Missing HOVER reference");
+            }
+
+            reference = hover_reference_->sample(state);
         }
 
-        has_reference_ = true;
-
-        const auto input = make_controller_input(
-            latest_reference_, dt);
-
-        if (!controller_initialized_) {
-            controller_->initialize(input, direction);
-            controller_initialized_ = true;
-        }
-
-        const auto result = controller_->update(input);
+        const auto result = controller_->update(
+            make_input(state, reference, dt));
 
         if (result.output.mode != drone_node::ControlMode::VELOCITY ||
             !result.output.velocity.allFinite() ||
@@ -775,12 +547,12 @@ void FlightController::control_loop()
                 "Invalid physical controller result");
         }
 
-        position_error_ = result.errors.position_error;
-        yaw_error_ = result.errors.yaw_error;
-
         publish_velocity_setpoint(
             result.output.velocity,
             result.output.yaw_rate);
+
+        position_error_ = result.errors.position_error;
+        yaw_error_ = result.errors.yaw_error;
     } catch (const std::exception& e) {
         RCLCPP_ERROR(
             get_logger(),
@@ -791,21 +563,73 @@ void FlightController::control_loop()
     }
 }
 
+void FlightController::control_loop()
+{
+    const auto begin = SteadyClock::now();
+
+    run_control_cycle();
+
+    if (control_state_ != ControlStatus::TRACKING &&
+        control_state_ != ControlStatus::HOVER) {
+        consecutive_overruns_ = 0;
+        return;
+    }
+
+    const double cost = std::chrono::duration<double>(
+        SteadyClock::now() - begin).count();
+
+    if (cost > 0.8 / active_control_frequency_) {
+        ++consecutive_overruns_;
+    } else {
+        consecutive_overruns_ = 0;
+    }
+
+    // Reduce frequency after sustained high computation cost.
+    // No asynchronous controller worker is introduced.
+    if (consecutive_overruns_ >= 5) {
+        const double next_frequency = std::min(
+            active_control_frequency_, 0.8 / cost);
+
+        try {
+            set_control_timer(next_frequency);
+
+            RCLCPP_WARN(
+                get_logger(),
+                "Control frequency reduced to %.2f Hz",
+                active_control_frequency_);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "Control scheduling failed: %s",
+                e.what());
+            enter_fault(ControlStatus::FAULT_CONTROLLER_ERROR);
+        }
+    }
+}
+
 void FlightController::status_loop()
 {
     ControlStatus status{};
-
     status.stamp = now();
 
     status.trajectory_id =
-        control_state_ == ControlStatus::TRACKING ?
-        trajectory_manager_.trajectory_id() : 0;
+        control_state_ == ControlStatus::TRACKING
+            ? trajectory_manager_.trajectory_id()
+            : 0;
 
     status.state = control_state_;
     status.fault_code = fault_code_;
 
-    status.position_error = position_error_;
-    status.yaw_error = yaw_error_;
+    const bool fresh = drone_node::StateCache::usable(
+        state_cache_->snapshot(SteadyClock::now()));
+
+    status.position_error = fresh
+        ? position_error_
+        : std::numeric_limits<double>::quiet_NaN();
+
+    status.yaw_error = fresh
+        ? yaw_error_
+        : std::numeric_limits<double>::quiet_NaN();
 
     control_status_pub_->publish(status);
 }

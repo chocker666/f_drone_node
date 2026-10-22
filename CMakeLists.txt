@@ -284,6 +284,23 @@ endif()
 # ============================================================
 
 if(BUILD_TESTING)
+  add_executable(test_state_cache_hover
+    test/ctrl/test_state_cache_hover.cpp
+  )
+
+  target_include_directories(test_state_cache_hover PRIVATE
+    ${DRONE_INCLUDE_DIR}
+  )
+
+  target_link_libraries(test_state_cache_hover
+    Eigen3::Eigen
+    Threads::Threads
+  )
+
+  add_test(
+    NAME state_cache_hover
+    COMMAND test_state_cache_hover
+  )
   add_executable(test_list_sampler
     test/ctrl/test_list_sampler.cpp
     src/ctrl/trajectory_manager.cpp
