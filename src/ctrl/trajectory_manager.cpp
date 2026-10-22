@@ -1,16 +1,18 @@
 #include "drone_node/ctrl/trajectory_manager.hpp"
 
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
 #include "drone_node/ctrl/trajectory_sampler/fixed_sampler.hpp"
+#include "drone_node/ctrl/trajectory_sampler/discrete_sampler.hpp"
 
 namespace drone_node
 {
 
 TrajectoryManager::AcceptResult TrajectoryManager::accept(
     const ControlTrajectory& msg,
-    const rclcpp::Time& now,
+    SteadyTime now,
     std::string& reason)
 {
     reason.clear();
@@ -20,15 +22,6 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
         return AcceptResult::REJECTED;
     }
 
-    // LIST execution is introduced in the sampler migration stage.
-    // PARAMETRIC remains reserved.
-    if (msg.trajectory_type != ControlTrajectory::POINT) {
-        reason = "unsupported trajectory_type";
-        return AcceptResult::REJECTED;
-    }
-
-    // Temporary selection checks until the controller factory
-    // and named configuration profiles are introduced.
     if (msg.controller_id != "position_yaw_pid") {
         reason = "unsupported controller_id";
         return AcceptResult::REJECTED;
@@ -39,27 +32,43 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
         return AcceptResult::REJECTED;
     }
 
-    using FixedTrajectory = drone_node::msg::FixedTrajectory;
-
-    const uint8_t direction = msg.point_params.yaw_direction;
-
-    if (direction != FixedTrajectory::SHORTEST &&
-        direction != FixedTrajectory::CW &&
-        direction != FixedTrajectory::CCW) {
-        reason = "invalid yaw_direction";
-        return AcceptResult::REJECTED;
-    }
-
     try {
-        // Construction validates position and yaw before replacement.
-        std::unique_ptr<SamplerBase> new_sampler =
-            std::make_unique<trajectory_sampler::FixedSampler>(
-                msg.point_params);
+        std::unique_ptr<SamplerBase> candidate;
+        uint8_t direction =
+            drone_node::msg::FixedTrajectory::SHORTEST;
+
+        switch (msg.trajectory_type) {
+        case ControlTrajectory::POINT:
+            candidate =
+                std::make_unique<trajectory_sampler::PointSampler>(
+                    msg.point_params);
+            direction = msg.point_params.yaw_direction;
+            break;
+
+        case ControlTrajectory::LIST:
+            candidate =
+                std::make_unique<trajectory_sampler::ListSampler>(
+                    msg.list_params);
+
+            // ListSampler rejects an empty list before this access.
+            direction =
+                msg.list_params.points.front().yaw_direction;
+            break;
+
+        case ControlTrajectory::PARAMETRIC:
+            reason = "PARAMETRIC sampling is reserved";
+            return AcceptResult::REJECTED;
+
+        default:
+            reason = "unsupported trajectory_type";
+            return AcceptResult::REJECTED;
+        }
 
         reason = "accepted";
 
-        // Commit only after all validation and construction succeed.
-        sampler_ = std::move(new_sampler);
+        // Validation and sampler construction have completed.
+        // Commit immediately; no cross-trajectory blending.
+        sampler_ = std::move(candidate);
         yaw_direction_ = direction;
         start_time_ = now;
         trajectory_id_ = msg.trajectory_id;
@@ -77,34 +86,42 @@ bool TrajectoryManager::has_trajectory() const noexcept
     return has_trajectory_;
 }
 
-bool TrajectoryManager::is_started(
-    const rclcpp::Time& now) const
+bool TrajectoryManager::is_started(SteadyTime now) const noexcept
 {
     return has_trajectory_ && now >= start_time_;
 }
 
-double TrajectoryManager::elapsed(
-    const rclcpp::Time& now) const
+double TrajectoryManager::elapsed(SteadyTime now) const
 {
     if (!has_trajectory_) {
         throw std::logic_error("No active trajectory");
     }
 
-    return (now - start_time_).seconds();
+    if (now < start_time_) {
+        throw std::invalid_argument(
+            "Sample time precedes trajectory activation");
+    }
+
+    return std::chrono::duration<double>(
+        now - start_time_).count();
 }
 
-ReferenceState TrajectoryManager::sample(
-    const rclcpp::Time& now) const
+ReferenceState TrajectoryManager::sample(SteadyTime now) const
 {
     if (!has_trajectory_ || !sampler_) {
         throw std::logic_error("No active sampler");
     }
 
-    if (!is_started(now)) {
-        throw std::logic_error("Trajectory has not started");
+    return sampler_->sample(elapsed(now));
+}
+
+double TrajectoryManager::duration() const
+{
+    if (!has_trajectory_ || !sampler_) {
+        throw std::logic_error("No active sampler");
     }
 
-    return sampler_->sample(elapsed(now));
+    return sampler_->duration();
 }
 
 uint64_t TrajectoryManager::trajectory_id() const noexcept
@@ -120,7 +137,21 @@ uint8_t TrajectoryManager::yaw_direction() const noexcept
 void TrajectoryManager::clear() noexcept
 {
     sampler_.reset();
+    yaw_direction_ = drone_node::msg::FixedTrajectory::SHORTEST;
+    trajectory_id_ = 0;
+    start_time_ = SteadyTime{};
     has_trajectory_ = false;
 }
+
+void TrajectoryManager::activate(SteadyTime now)
+{
+    if (!has_trajectory_ || !sampler_) {
+        throw std::logic_error(
+            "Cannot activate an empty trajectory");
+    }
+
+    start_time_ = now;
+}
+
 
 }  // namespace drone_node

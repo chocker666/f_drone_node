@@ -38,7 +38,7 @@ private:
     using ControlStatus = drone_node::msg::ControlStatus;
     using ControlCommand = drone_node::msg::ControlCommand;
     using FixedTrajectory = drone_node::msg::FixedTrajectory;
-    using FixedSampler = drone_node::trajectory_sampler::FixedSampler;
+    using PointSampler = drone_node::trajectory_sampler::PointSampler;
     using SteadyClock = std::chrono::steady_clock;
 
     struct Feedback
@@ -98,7 +98,7 @@ private:
     bool controller_initialized_{false};
 
     drone_node::TrajectoryManager trajectory_manager_;
-    std::unique_ptr<FixedSampler> hover_sampler_;
+    std::unique_ptr<PointSampler> hover_sampler_;
 
     Feedback latest_vehicle_state_{};
     std::array<bool, 3> feedback_received_{};

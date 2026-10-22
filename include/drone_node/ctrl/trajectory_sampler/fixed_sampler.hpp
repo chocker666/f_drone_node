@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include "drone_node/ctrl/trajectory_sampler/trajectory_sampler_base.hpp"
@@ -7,10 +6,12 @@
 namespace drone_node::trajectory_sampler
 {
 
-class FixedSampler final : public TrajectorySamplerBase
+// Existing filename and FixedTrajectory message are retained.
+// POINT is an immediately active, indefinite position/yaw reference.
+class PointSampler final : public TrajectorySamplerBase
 {
 public:
-    explicit FixedSampler(
+    explicit PointSampler(
         const drone_node::msg::FixedTrajectory& trajectory);
 
     ReferenceState sample(double t) const override;

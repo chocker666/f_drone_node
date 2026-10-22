@@ -7,9 +7,11 @@
 namespace drone_node::trajectory_sampler
 {
 
-FixedSampler::FixedSampler(
+PointSampler::PointSampler(
     const drone_node::msg::FixedTrajectory& trajectory)
 {
+    using Point = drone_node::msg::FixedTrajectory;
+
     const auto& p = trajectory.position;
 
     if (!std::isfinite(p.x) ||
@@ -17,31 +19,35 @@ FixedSampler::FixedSampler(
         !std::isfinite(p.z) ||
         !std::isfinite(trajectory.yaw)) {
         throw std::invalid_argument(
-            "FixedSampler: invalid fixed reference");
+            "PointSampler: non-finite reference");
     }
 
-    reference_.position = Eigen::Vector3d(
-        p.x, p.y, p.z);
+    if (trajectory.yaw_direction != Point::SHORTEST &&
+        trajectory.yaw_direction != Point::CW &&
+        trajectory.yaw_direction != Point::CCW) {
+        throw std::invalid_argument(
+            "PointSampler: invalid yaw direction");
+    }
 
+    reference_.position = Eigen::Vector3d(p.x, p.y, p.z);
     reference_.velocity.setZero();
     reference_.acceleration.setZero();
-
-    // Both message and internal reference use radians.
     reference_.yaw = trajectory.yaw;
     reference_.yaw_rate = 0.0;
 }
 
-ReferenceState FixedSampler::sample(double t) const
+ReferenceState PointSampler::sample(double t) const
 {
     if (!std::isfinite(t) || t < 0.0) {
         throw std::invalid_argument(
-            "FixedSampler: invalid sample time");
+            "PointSampler: invalid sample time");
     }
 
+    // No interpolation or smoothing of a new POINT target.
     return reference_;
 }
 
-double FixedSampler::duration() const
+double PointSampler::duration() const
 {
     return std::numeric_limits<double>::infinity();
 }

@@ -121,6 +121,7 @@ set(CTRL_SOURCES
   src/ctrl/flight_controller.cpp
   src/ctrl/trajectory_manager.cpp
   src/ctrl/trajectory_sampler/fixed_sampler.cpp
+  src/ctrl/trajectory_sampler/discrete_sampler.cpp
 )
 
 # ============================================================
@@ -283,6 +284,46 @@ endif()
 # ============================================================
 
 if(BUILD_TESTING)
+  add_executable(test_list_sampler
+    test/ctrl/test_list_sampler.cpp
+    src/ctrl/trajectory_manager.cpp
+    src/ctrl/trajectory_sampler/fixed_sampler.cpp
+    src/ctrl/trajectory_sampler/discrete_sampler.cpp
+  )
+
+  target_include_directories(test_list_sampler PRIVATE
+    ${DRONE_INCLUDE_DIR}
+  )
+
+  target_link_libraries(test_list_sampler
+    Eigen3::Eigen
+    "${cpp_typesupport_target}"
+  )
+
+  add_test(
+    NAME list_sampler
+    COMMAND test_list_sampler
+  )
+  add_executable(test_trajectory_manager
+    test/ctrl/test_trajectory_manager.cpp
+    src/ctrl/trajectory_manager.cpp
+    src/ctrl/trajectory_sampler/fixed_sampler.cpp
+    src/ctrl/trajectory_sampler/discrete_sampler.cpp
+  )
+
+  target_include_directories(test_trajectory_manager PRIVATE
+    ${DRONE_INCLUDE_DIR}
+  )
+
+  target_link_libraries(test_trajectory_manager
+    Eigen3::Eigen
+    "${cpp_typesupport_target}"
+  )
+
+  add_test(
+    NAME trajectory_manager
+    COMMAND test_trajectory_manager
+  )
   add_executable(test_position_yaw_pid_controller
     test/ctrl/test_position_yaw_pid_controller.cpp
   )

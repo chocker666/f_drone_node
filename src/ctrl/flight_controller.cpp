@@ -431,7 +431,7 @@ void FlightController::enter_hover()
     }
 
     // Capture the actual pose once. Do not update it each cycle.
-    auto new_sampler = std::make_unique<FixedSampler>(
+    auto new_sampler = std::make_unique<PointSampler>(
         make_current_fixed_reference());
 
     hover_sampler_ = std::move(new_sampler);
@@ -611,35 +611,17 @@ void FlightController::trajectory_callback(
         return;
     }
 
-    if (msg->trajectory_type != ControlTrajectory::POINT ||
-        msg->config_name != "default") {
-        RCLCPP_WARN(
-            get_logger(),
-            "Trajectory rejected: unsupported type or config");
-        return;
-    }
-
     try {
-        // Prepare and initialize the candidate before replacement.
-        const FixedSampler initial_sampler(msg->point_params);
-        const auto input = make_controller_input(
-            initial_sampler.sample(0.0),
-            1.0 / control_frequency_);
-
-        auto candidate =
-            drone_node::controller::ControllerFactory::create(
-                msg->controller_id, controller_config_);
-
-        candidate->initialize(
-            input,
-            static_cast<drone_node::controller::YawDirection>(
-                msg->point_params.yaw_direction));
+        // Prepare everything in local objects.
+        // Failure must leave the active trajectory/controller intact.
+        drone_node::TrajectoryManager pending_trajectory;
+        const drone_node::SteadyTime preparation_origin{};
 
         std::string reason;
-        const auto result = trajectory_manager_.accept(
-            *msg, now(), reason);
+        const auto accepted = pending_trajectory.accept(
+            *msg, preparation_origin, reason);
 
-        if (result ==
+        if (accepted ==
             drone_node::TrajectoryManager::AcceptResult::REJECTED) {
             RCLCPP_WARN(
                 get_logger(),
@@ -649,11 +631,31 @@ void FlightController::trajectory_callback(
             return;
         }
 
-        hover_sampler_.reset();
+        const auto initial_reference =
+            pending_trajectory.sample(preparation_origin);
+
+        const auto input = make_controller_input(
+            initial_reference,
+            1.0 / control_frequency_);
+
+        auto pending_controller =
+            drone_node::controller::ControllerFactory::create(
+                msg->controller_id, controller_config_);
+
+        pending_controller->initialize(
+            input,
+            static_cast<drone_node::controller::YawDirection>(
+                pending_trajectory.yaw_direction()));
+
+        // Start the clock only after preparation has succeeded.
+        pending_trajectory.activate(SteadyClock::now());
+
         reset_control_runtime();
 
-        controller_ = std::move(candidate);
+        trajectory_manager_ = std::move(pending_trajectory);
+        controller_ = std::move(pending_controller);
         controller_initialized_ = true;
+        hover_sampler_.reset();
 
         fault_code_ = ControlStatus::FAULT_NONE;
         change_control_state(ControlStatus::TRACKING);
@@ -703,7 +705,6 @@ void FlightController::control_loop()
     }
 
     const auto steady_now = SteadyClock::now();
-    const auto ros_now = now();
 
     if (!state_is_fresh()) {
         enter_fault(ControlStatus::FAULT_STATE_TIMEOUT);
@@ -738,7 +739,7 @@ void FlightController::control_loop()
                     "TRACKING without an active trajectory");
             }
 
-            latest_reference_ = trajectory_manager_.sample(ros_now);
+            latest_reference_ = trajectory_manager_.sample(steady_now);
             direction =
                 static_cast<drone_node::controller::YawDirection>(
                     trajectory_manager_.yaw_direction());
