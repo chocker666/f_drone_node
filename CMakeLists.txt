@@ -37,6 +37,7 @@ set(INTER_MSG_FILES
 set(CTRL_MSG_FILES
   "msg/ControlTrajectory.msg"
   "msg/FixedTrajectory.msg"
+  "msg/ListTrajectory.msg"
   "msg/PIDParams.msg"
   "msg/ControlStatus.msg"
   "msg/ControlCommand.msg"

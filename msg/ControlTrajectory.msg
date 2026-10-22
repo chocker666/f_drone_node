@@ -1,18 +1,20 @@
-# Unified trajectory command.
-
+# Unified trajectory command in local ENU.
+# Accepted trajectories activate immediately.
 uint64 trajectory_id
-
-builtin_interfaces/Time start_time
-
 string frame_id
 
-# Trajectory type
-uint8 FIXED=0
+uint8 POINT=0
+uint8 LIST=1
+uint8 PARAMETRIC=2
 uint8 trajectory_type
 
-# Fixed trajectory parameters
-FixedTrajectory fixed_params
+# Only the payload selected by trajectory_type is interpreted.
+FixedTrajectory point_params
+ListTrajectory list_params
 
-# Controller type
-uint8 PID=0
-uint8 controller_type
+# PARAMETRIC is reserved.
+# Its payload and sampler design have not been determined.
+
+# Physical controller and parameter profile are independent.
+string controller_id "position_yaw_pid"
+string config_name "default"

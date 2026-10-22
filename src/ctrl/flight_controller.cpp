@@ -644,30 +644,14 @@ void FlightController::trajectory_callback(
         return;
     }
 
-    const auto ros_now = now();
-
-    // This version only supports immediately active trajectories.
-    // Zero start_time is interpreted by TrajectoryManager as now.
-    const rclcpp::Time requested_start(
-        msg->start_time, ros_now.get_clock_type());
-
-    if (requested_start.nanoseconds() != 0 &&
-        requested_start > ros_now) {
-
-        RCLCPP_WARN(
-            get_logger(),
-            "Trajectory rejected: future start_time unsupported");
-        return;
-    }
-
+    const auto activation_time = now();
     std::string reason;
 
-    const auto result =
-        trajectory_manager_.accept(*msg, ros_now, reason);
+    const auto result = trajectory_manager_.accept(
+        *msg, activation_time, reason);
 
     if (result ==
         drone_node::TrajectoryManager::AcceptResult::REJECTED) {
-
         RCLCPP_WARN(
             get_logger(),
             "Trajectory %lu rejected: %s",
