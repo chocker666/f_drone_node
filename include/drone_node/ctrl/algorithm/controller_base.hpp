@@ -1,45 +1,24 @@
-
 #pragma once
 
-#include <Eigen/Core>
+#include "drone_node/ctrl/algorithm/algorithm_base.hpp"
 
 namespace drone_node::algorithm
 {
 
-template<int N>
-using ControlVector = Eigen::Matrix<double, N, 1>;
+// Transitional aliases for existing PID and FlightController code.
+// These names refer only to mathematical algorithms.
+// Physical controllers use drone_node::controller::ControllerBase.
 
 template<int N>
-struct ControllerInput
-{
-    ControlVector<N> error{
-        ControlVector<N>::Zero()};
-
-    ControlVector<N> error_rate{
-        ControlVector<N>::Zero()};
-
-    double dt{0.02};
-};
+using ControlVector = AlgorithmVector<N>;
 
 template<int N>
-struct ControllerOutput
-{
-    ControlVector<N> command{
-        ControlVector<N>::Zero()};
-};
+using ControllerInput = AlgorithmInput<N>;
 
 template<int N>
-class ControllerBase
-{
-public:
-    static_assert(N >= 1, "Control dimension must be positive");
+using ControllerOutput = AlgorithmOutput<N>;
 
-    virtual ~ControllerBase() = default;
-
-    virtual void reset() = 0;
-
-    virtual ControllerOutput<N> update(
-        const ControllerInput<N>& input) = 0;
-};
+template<int N>
+using ControllerBase = AlgorithmBase<N>;
 
 }  // namespace drone_node::algorithm
