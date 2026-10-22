@@ -96,6 +96,18 @@ target_link_libraries(drone_control_algorithms PUBLIC
   Eigen3::Eigen
 )
 
+add_library(drone_physical_controllers STATIC
+  src/ctrl/controller/position_yaw_pid_controller.cpp
+  src/ctrl/controller/controller_factory.cpp
+)
+
+target_include_directories(drone_physical_controllers PUBLIC
+  ${DRONE_INCLUDE_DIR}
+)
+
+target_link_libraries(drone_physical_controllers PUBLIC
+  drone_control_algorithms
+)
 # ============================================================
 # Source groups
 # ============================================================
@@ -157,7 +169,7 @@ ament_target_dependencies(flight_controller_exec
 )
 
 target_link_libraries(flight_controller_exec
-  drone_control_algorithms
+  drone_physical_controllers
   "${cpp_typesupport_target}"
 )
 
@@ -184,7 +196,7 @@ ament_target_dependencies(drone_node_exec
 )
 
 target_link_libraries(drone_node_exec
-  drone_control_algorithms
+  drone_physical_controllers
   Eigen3::Eigen
   Threads::Threads
   "${cpp_typesupport_target}"
@@ -271,6 +283,18 @@ endif()
 # ============================================================
 
 if(BUILD_TESTING)
+  add_executable(test_position_yaw_pid_controller
+    test/ctrl/test_position_yaw_pid_controller.cpp
+  )
+
+  target_link_libraries(test_position_yaw_pid_controller
+    drone_physical_controllers
+  )
+
+  add_test(
+    NAME position_yaw_pid_controller
+    COMMAND test_position_yaw_pid_controller
+  )
   find_package(ament_lint_auto REQUIRED)
 
   set(ament_cmake_copyright_FOUND TRUE)

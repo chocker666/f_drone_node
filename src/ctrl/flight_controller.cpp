@@ -9,10 +9,6 @@
 #include <string>
 #include <utility>
 
-using drone_node::algorithm::PIDParameters;
-using PositionPID = drone_node::algorithm::PIDController<3>;
-using PositionInput = drone_node::algorithm::ControllerInput<3>;
-using YawInput = drone_node::algorithm::ControllerInput<1>;
 
 namespace
 {
@@ -92,10 +88,11 @@ FlightController::FlightController(
         "yaw_pid",
         drone_node::algorithm::PIDLimitMode::PER_AXIS);
 
-    controller_ =
-        std::make_unique<PositionPID>(position_pid_params);
+    controller_config_.position = position_pid_params;
+    controller_config_.yaw = yaw_pid_params;
 
-    yaw_controller_.set_parameters(yaw_pid_params);
+    controller_ = drone_node::controller::ControllerFactory::create(
+        "position_yaw_pid", controller_config_);
 
     RCLCPP_INFO(
         get_logger(),
@@ -235,41 +232,6 @@ double FlightController::yaw_from_quaternion(
     return std::atan2(siny, cosy);
 }
 
-double FlightController::select_yaw_delta(
-    double current_yaw,
-    double target_yaw,
-    uint8_t direction)
-{
-    double delta = wrap_pi(target_yaw - current_yaw);
-
-    if (std::abs(std::abs(delta) - PI) < ANGLE_EPS) {
-        delta = PI;
-    }
-
-    switch (direction) {
-    case FixedTrajectory::SHORTEST:
-        break;
-
-    case FixedTrajectory::CW:
-        if (delta > 0.0) {
-            delta -= TWO_PI;
-        }
-        break;
-
-    case FixedTrajectory::CCW:
-        if (delta < 0.0) {
-            delta += TWO_PI;
-        }
-        break;
-
-    default:
-        throw std::invalid_argument(
-            "Invalid yaw direction");
-    }
-
-    return delta;
-}
-
 void FlightController::update_unwrapped_yaw(
     double measured_yaw)
 {
@@ -314,34 +276,6 @@ void FlightController::update_unwrapped_yaw(
 
     previous_wrapped_yaw_ = measured_yaw;
     last_yaw_receive_time_ = receive_time;
-}
-
-void FlightController::initialize_yaw_reference(
-    double target_yaw,
-    uint8_t yaw_direction)
-{
-    if (!has_yaw_measurement_) {
-        throw std::runtime_error(
-            "Yaw measurement unavailable");
-    }
-
-    const double delta = select_yaw_delta(
-        unwrapped_yaw_,
-        target_yaw,
-        yaw_direction);
-
-    target_unwrapped_yaw_ = unwrapped_yaw_ + delta;
-
-    yaw_controller_.reset();
-    yaw_reference_initialized_ = true;
-
-    RCLCPP_INFO(
-        get_logger(),
-        "Yaw target initialized: current=%.2f deg, "
-        "target=%.2f deg, delta=%.2f deg",
-        unwrapped_yaw_ * RAD_TO_DEG,
-        target_unwrapped_yaw_ * RAD_TO_DEG,
-        delta * RAD_TO_DEG);
 }
 
 void FlightController::position_callback(const PointStamped::SharedPtr msg)
@@ -426,18 +360,51 @@ FlightController::make_current_fixed_reference() const
 
 void FlightController::reset_control_runtime()
 {
-    controller_->reset();
-    yaw_controller_.reset();
+    if (controller_) {
+        controller_->reset();
+    }
 
-    yaw_reference_initialized_ = false;
+    controller_initialized_ = false;
     has_last_control_time_ = false;
     has_reference_ = false;
 
-    position_error_ =
-        std::numeric_limits<double>::quiet_NaN();
+    position_error_ = std::numeric_limits<double>::quiet_NaN();
+    yaw_error_ = std::numeric_limits<double>::quiet_NaN();
+}
 
-    yaw_error_ =
-        std::numeric_limits<double>::quiet_NaN();
+drone_node::PhysicalControllerInput
+FlightController::make_controller_input(
+    const drone_node::ReferenceState& reference,
+    double dt) const
+{
+    drone_node::PhysicalControllerInput input;
+    input.reference = reference;
+    input.reference_validity = {true, true, true, true, true};
+    input.dt = dt;
+
+    auto& state = input.state;
+    state.captured_at = SteadyClock::now();
+
+    const auto& p = latest_vehicle_state_.position;
+    const auto& v = latest_vehicle_state_.velocity;
+    const auto& q = latest_vehicle_state_.orientation;
+
+    state.position = Eigen::Vector3d(p.x, p.y, p.z);
+    state.velocity = Eigen::Vector3d(v.x, v.y, v.z);
+    state.orientation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
+
+    state.position_feedback = {
+        feedback_received_[0], feedback_time_[0]};
+    state.velocity_feedback = {
+        feedback_received_[1], feedback_time_[1]};
+    state.attitude_feedback = {
+        feedback_received_[2], feedback_time_[2]};
+
+    state.unwrapped_yaw = unwrapped_yaw_;
+    state.measured_yaw_rate = measured_yaw_rate_;
+    state.yaw_valid = has_yaw_measurement_;
+
+    return input;
 }
 
 void FlightController::change_control_state(uint8_t state)
@@ -644,33 +611,64 @@ void FlightController::trajectory_callback(
         return;
     }
 
-    const auto activation_time = now();
-    std::string reason;
-
-    const auto result = trajectory_manager_.accept(
-        *msg, activation_time, reason);
-
-    if (result ==
-        drone_node::TrajectoryManager::AcceptResult::REJECTED) {
+    if (msg->trajectory_type != ControlTrajectory::POINT ||
+        msg->config_name != "default") {
         RCLCPP_WARN(
             get_logger(),
-            "Trajectory %lu rejected: %s",
-            static_cast<unsigned long>(msg->trajectory_id),
-            reason.c_str());
+            "Trajectory rejected: unsupported type or config");
         return;
     }
 
-    hover_sampler_.reset();
-    reset_control_runtime();
+    try {
+        // Prepare and initialize the candidate before replacement.
+        const FixedSampler initial_sampler(msg->point_params);
+        const auto input = make_controller_input(
+            initial_sampler.sample(0.0),
+            1.0 / control_frequency_);
 
-    fault_code_ = ControlStatus::FAULT_NONE;
-    change_control_state(ControlStatus::TRACKING);
+        auto candidate =
+            drone_node::controller::ControllerFactory::create(
+                msg->controller_id, controller_config_);
 
-    RCLCPP_INFO(
-        get_logger(),
-        "Trajectory %lu accepted",
-        static_cast<unsigned long>(
-            trajectory_manager_.trajectory_id()));
+        candidate->initialize(
+            input,
+            static_cast<drone_node::controller::YawDirection>(
+                msg->point_params.yaw_direction));
+
+        std::string reason;
+        const auto result = trajectory_manager_.accept(
+            *msg, now(), reason);
+
+        if (result ==
+            drone_node::TrajectoryManager::AcceptResult::REJECTED) {
+            RCLCPP_WARN(
+                get_logger(),
+                "Trajectory %lu rejected: %s",
+                static_cast<unsigned long>(msg->trajectory_id),
+                reason.c_str());
+            return;
+        }
+
+        hover_sampler_.reset();
+        reset_control_runtime();
+
+        controller_ = std::move(candidate);
+        controller_initialized_ = true;
+
+        fault_code_ = ControlStatus::FAULT_NONE;
+        change_control_state(ControlStatus::TRACKING);
+
+        RCLCPP_INFO(
+            get_logger(),
+            "Trajectory %lu accepted",
+            static_cast<unsigned long>(
+                trajectory_manager_.trajectory_id()));
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Trajectory preparation rejected: %s",
+            e.what());
+    }
 }
 
 void FlightController::publish_velocity_setpoint(
@@ -694,13 +692,12 @@ void FlightController::publish_velocity_setpoint(
 
 void FlightController::control_loop()
 {
-    // IDLE and FAULT never produce normal control setpoints.
     if (control_state_ == ControlStatus::IDLE ||
         control_state_ == ControlStatus::FAULT) {
         return;
     }
 
-    // TRACKING/HOVER may be prepared while output is disabled.
+    // Removed in the FSM migration stage.
     if (!enable_setpoint_stream_) {
         return;
     }
@@ -727,92 +724,62 @@ void FlightController::control_loop()
     has_last_control_time_ = true;
 
     try {
-        uint8_t yaw_direction = FixedTrajectory::SHORTEST;
+        if (!controller_) {
+            throw std::runtime_error(
+                "Missing physical controller");
+        }
+
+        auto direction =
+            drone_node::controller::YawDirection::SHORTEST;
 
         if (control_state_ == ControlStatus::TRACKING) {
-
             if (!trajectory_manager_.has_trajectory()) {
                 throw std::runtime_error(
                     "TRACKING without an active trajectory");
             }
 
-            latest_reference_ =
-                trajectory_manager_.sample(ros_now);
-
-            yaw_direction =
-                trajectory_manager_.yaw_direction();
-
+            latest_reference_ = trajectory_manager_.sample(ros_now);
+            direction =
+                static_cast<drone_node::controller::YawDirection>(
+                    trajectory_manager_.yaw_direction());
         } else if (control_state_ == ControlStatus::HOVER) {
-
             if (!hover_sampler_) {
                 throw std::runtime_error(
-                    "HOVER without FixedSampler");
+                    "HOVER without reference sampler");
             }
 
             latest_reference_ = hover_sampler_->sample(0.0);
-
         } else {
             return;
         }
 
         has_reference_ = true;
 
-        if (!yaw_reference_initialized_) {
-            initialize_yaw_reference(
-                latest_reference_.yaw,
-                yaw_direction);
+        const auto input = make_controller_input(
+            latest_reference_, dt);
+
+        if (!controller_initialized_) {
+            controller_->initialize(input, direction);
+            controller_initialized_ = true;
         }
 
-        const auto& p = latest_vehicle_state_.position;
-        const auto& v = latest_vehicle_state_.velocity;
+        const auto result = controller_->update(input);
 
-        const Eigen::Vector3d current_position(
-            p.x, p.y, p.z);
-
-        const Eigen::Vector3d current_velocity(
-            v.x, v.y, v.z);
-
-        // Position PID: position error -> velocity command.
-        PositionInput position_input;
-
-        position_input.error =
-            latest_reference_.position - current_position;
-
-        position_input.error_rate =
-            latest_reference_.velocity - current_velocity;
-
-        position_input.dt = dt;
-
-        const auto position_output =
-            controller_->update(position_input);
-
-        // Yaw PID: yaw error -> yaw-rate command.
-        YawInput yaw_input;
-
-        yaw_input.error(0) =
-            target_unwrapped_yaw_ - unwrapped_yaw_;
-
-        yaw_input.error_rate(0) =
-            latest_reference_.yaw_rate - measured_yaw_rate_;
-
-        yaw_input.dt = dt;
-
-        const auto yaw_output =
-            yaw_controller_.update(yaw_input);
-
-        if (!position_output.command.allFinite() ||
-            !yaw_output.command.allFinite()) {
+        if (result.output.mode != drone_node::ControlMode::VELOCITY ||
+            !result.output.velocity.allFinite() ||
+            !std::isfinite(result.output.yaw_rate) ||
+            !std::isfinite(result.errors.position_error) ||
+            !std::isfinite(result.errors.yaw_error)) {
             throw std::runtime_error(
-                "Non-finite controller output");
+                "Invalid physical controller result");
         }
 
-        position_error_ = position_input.error.norm();
-        yaw_error_ = yaw_input.error(0);
+        position_error_ = result.errors.position_error;
+        yaw_error_ = result.errors.yaw_error;
 
         publish_velocity_setpoint(
-            position_output.command,
-            yaw_output.command(0));
-
+            result.output.velocity,
+            result.output.yaw_rate);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(
             get_logger(),
