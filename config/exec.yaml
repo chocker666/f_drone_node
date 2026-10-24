@@ -1,0 +1,14 @@
+motion_executor:
+  ros__parameters:
+    takeoff:
+      default_height: 1.5
+      position_tolerance: 0.15
+      velocity_tolerance: 0.15
+      settle_duration: 0.5
+      timeout: 15.0
+
+    execution:
+      check_frequency: 20.0
+      state_timeout: 0.3
+      tracking_ack_timeout: 1.0
+      hover_ack_timeout: 1.0

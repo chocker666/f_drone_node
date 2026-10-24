@@ -14,7 +14,7 @@ def generate_launch_description():
             output="screen",
             parameters=[
                 str(config / "inter.yaml"),
-                str(config / "flight_controller.yaml"),
+                str(config / "ctrl.yaml"),
             ],
         ),
     ])
