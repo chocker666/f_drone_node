@@ -6,8 +6,8 @@
 namespace drone_node::trajectory_sampler
 {
 
-// Existing filename and FixedTrajectory message are retained.
-// POINT is an immediately active, indefinite position/yaw reference.
+// POINT sampler: maintains a fixed position/yaw reference indefinitely.
+// FixedTrajectory is retained as the ROS message payload type.
 class PointSampler final : public TrajectorySamplerBase
 {
 public:

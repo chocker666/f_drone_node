@@ -1,4 +1,4 @@
-#include "drone_node/ctrl/trajectory_sampler/discrete_sampler.hpp"
+#include "drone_node/ctrl/trajectory_sampler/list_sampler.hpp"
 
 #include <algorithm>
 #include <cmath>

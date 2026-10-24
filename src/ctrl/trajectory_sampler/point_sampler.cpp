@@ -1,4 +1,4 @@
-#include "drone_node/ctrl/trajectory_sampler/fixed_sampler.hpp"
+#include "drone_node/ctrl/trajectory_sampler/point_sampler.hpp"
 
 #include <cmath>
 #include <limits>

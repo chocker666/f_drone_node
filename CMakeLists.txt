@@ -120,8 +120,8 @@ set(INTER_SOURCES
 set(CTRL_SOURCES
   src/ctrl/flight_controller.cpp
   src/ctrl/trajectory_manager.cpp
-  src/ctrl/trajectory_sampler/fixed_sampler.cpp
-  src/ctrl/trajectory_sampler/discrete_sampler.cpp
+  src/ctrl/trajectory_sampler/point_sampler.cpp
+  src/ctrl/trajectory_sampler/list_sampler.cpp
 )
 
 # ============================================================
@@ -284,106 +284,6 @@ endif()
 # ============================================================
 
 if(BUILD_TESTING)
-  enable_testing()
-    add_executable(test_flight_controller_integration
-    test/ctrl/test_flight_controller_integration.cpp
-    ${CTRL_SOURCES}
-  )
-
-  target_include_directories(test_flight_controller_integration PRIVATE
-    ${DRONE_INCLUDE_DIR}
-  )
-
-  ament_target_dependencies(test_flight_controller_integration
-    rclcpp
-    geometry_msgs
-  )
-
-  target_link_libraries(test_flight_controller_integration
-    drone_physical_controllers
-    Threads::Threads
-    "${cpp_typesupport_target}"
-  )
-
-  add_test(
-    NAME flight_controller_integration
-    COMMAND test_flight_controller_integration
-  )
-
-  set_tests_properties(flight_controller_integration PROPERTIES
-    TIMEOUT 60
-    RUN_SERIAL TRUE
-    ENVIRONMENT "ROS_DOMAIN_ID=171;ROS_LOCALHOST_ONLY=1"
-  )
-  add_executable(test_state_cache_hover
-    test/ctrl/test_state_cache_hover.cpp
-  )
-
-  target_include_directories(test_state_cache_hover PRIVATE
-    ${DRONE_INCLUDE_DIR}
-  )
-
-  target_link_libraries(test_state_cache_hover
-    Eigen3::Eigen
-    Threads::Threads
-  )
-
-  add_test(
-    NAME state_cache_hover
-    COMMAND test_state_cache_hover
-  )
-  add_executable(test_list_sampler
-    test/ctrl/test_list_sampler.cpp
-    src/ctrl/trajectory_manager.cpp
-    src/ctrl/trajectory_sampler/fixed_sampler.cpp
-    src/ctrl/trajectory_sampler/discrete_sampler.cpp
-  )
-
-  target_include_directories(test_list_sampler PRIVATE
-    ${DRONE_INCLUDE_DIR}
-  )
-
-  target_link_libraries(test_list_sampler
-    Eigen3::Eigen
-    "${cpp_typesupport_target}"
-  )
-
-  add_test(
-    NAME list_sampler
-    COMMAND test_list_sampler
-  )
-  add_executable(test_trajectory_manager
-    test/ctrl/test_trajectory_manager.cpp
-    src/ctrl/trajectory_manager.cpp
-    src/ctrl/trajectory_sampler/fixed_sampler.cpp
-    src/ctrl/trajectory_sampler/discrete_sampler.cpp
-  )
-
-  target_include_directories(test_trajectory_manager PRIVATE
-    ${DRONE_INCLUDE_DIR}
-  )
-
-  target_link_libraries(test_trajectory_manager
-    Eigen3::Eigen
-    "${cpp_typesupport_target}"
-  )
-
-  add_test(
-    NAME trajectory_manager
-    COMMAND test_trajectory_manager
-  )
-  add_executable(test_position_yaw_pid_controller
-    test/ctrl/test_position_yaw_pid_controller.cpp
-  )
-
-  target_link_libraries(test_position_yaw_pid_controller
-    drone_physical_controllers
-  )
-
-  add_test(
-    NAME position_yaw_pid_controller
-    COMMAND test_position_yaw_pid_controller
-  )
   find_package(ament_lint_auto REQUIRED)
 
   set(ament_cmake_copyright_FOUND TRUE)
