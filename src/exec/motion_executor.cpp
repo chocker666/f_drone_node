@@ -835,4 +835,55 @@ void MotionExecutor::updateExecution()
     }
 }
 
+std::optional<std::uint64_t> MotionExecutor::startExecution(
+    const PlannedMotion& motion,
+    const ExecutionConstraints& constraints,
+    std::string& rejection_reason)
+{
+    rejection_reason.clear();
+
+    if (motion.planner_type != PlannerType::FIXED ||
+        motion.motion_type != PlannedMotionType::POINT) {
+        rejection_reason = "Only FIXED POINT motion is supported";
+        return std::nullopt;
+    }
+
+    // 同样校验直接构造的 PlannedMotion，
+    // 不假定所有调用方都经过了 FixedPlanner。
+    if (motion.frame_id != "map" ||
+        !motion.target_position.allFinite() ||
+        !std::isfinite(motion.target_yaw) ||
+        motion.yaw_direction > 2 ||
+        motion.controller_id != "position_yaw_pid" ||
+        motion.config_name.empty()) {
+        rejection_reason = "Invalid planned FIXED POINT motion";
+        return std::nullopt;
+    }
+
+    ControlTrajectory trajectory;
+
+    // 轨迹 ID 由阶段 2 的执行入口统一分配。
+    trajectory.frame_id = motion.frame_id;
+    trajectory.trajectory_type = ControlTrajectory::POINT;
+
+    trajectory.point_params.position.x =
+        motion.target_position.x();
+    trajectory.point_params.position.y =
+        motion.target_position.y();
+    trajectory.point_params.position.z =
+        motion.target_position.z();
+
+    trajectory.point_params.yaw = motion.target_yaw;
+    trajectory.point_params.yaw_direction =
+        motion.yaw_direction;
+
+    trajectory.controller_id = motion.controller_id;
+    trajectory.config_name = motion.config_name;
+
+    return startExecution(
+        std::move(trajectory),
+        constraints,
+        rejection_reason);
+}
+
 }  // namespace drone_node::exec

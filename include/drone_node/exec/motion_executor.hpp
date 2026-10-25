@@ -19,6 +19,7 @@
 #include "drone_node/msg/control_trajectory.hpp"
 #include "drone_node/srv/set_arming.hpp"
 
+#include "drone_node/exec/planner/planner_types.hpp"
 
 
 namespace drone_node::exec
@@ -130,10 +131,16 @@ public:
     // 这不会撤销已经发送给 Inter 的请求。
     bool removePendingArmRequest(std::int64_t request_id);
 
-        // 第一版只接受 map/ENU POINT。
+    // 第一版只接受 map/ENU POINT。
     // 成功时分配新的轨迹 ID，并立即发布；返回不代表执行成功。
     std::optional<std::uint64_t> startExecution(
         ControlTrajectory trajectory,
+        const ExecutionConstraints& constraints,
+        std::string& rejection_reason);
+
+    // 接收规划结果，转换为 Ctrl 消息后复用现有执行入口。
+    std::optional<std::uint64_t> startExecution(
+        const PlannedMotion& motion,
         const ExecutionConstraints& constraints,
         std::string& rejection_reason);
 
