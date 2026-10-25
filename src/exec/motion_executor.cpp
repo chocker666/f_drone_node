@@ -154,6 +154,26 @@ MotionExecutor::MotionExecutor(const rclcpp::NodeOptions& options)
         return value;
     };
 
+        status_timeout_ = positive_parameter(
+        "execution.status_timeout", 1.5);
+
+    hover_position_tolerance_ = positive_parameter(
+        "observation.hover_position_tolerance", 0.15);
+
+    hover_yaw_tolerance_ = positive_parameter(
+        "observation.hover_yaw_tolerance", 0.10);
+
+    hover_velocity_tolerance_ = positive_parameter(
+        "observation.hover_velocity_tolerance", 0.15);
+
+    hover_settle_duration_ = positive_parameter(
+        "observation.hover_settle_duration", 0.5);
+
+    if (hover_yaw_tolerance_ > std::acos(-1.0)) {
+        throw std::invalid_argument(
+            "observation.hover_yaw_tolerance must be <= pi");
+    }
+
     const double check_frequency = positive_parameter(
         "execution.check_frequency", 20.0);
 
@@ -188,8 +208,9 @@ MotionExecutor::MotionExecutor(const rclcpp::NodeOptions& options)
 
     RCLCPP_INFO(
         get_logger(),
-        "MotionExecutor communication initialized; "
-        "execution loop and Action servers are not enabled");
+        "MotionExecutor communication, execution and "
+        "real-state observation initialized; "
+        "Action servers are not enabled");
 }
 
 void MotionExecutor::sendTrajectory(
@@ -313,13 +334,15 @@ std::string MotionExecutor::stateProblem(
         return "Inter feedback frame must be map";
     }
 
-    if (!fresh(state.connected, time) ||
+    if (!statusFresh(state.connected, time) ||
         !state.connected.message.data) {
         return "Vehicle connection unavailable or disconnected";
     }
 
-    if (!fresh(state.armed, time) || !state.armed.message.data)
+    if (!statusFresh(state.armed, time) ||
+        !state.armed.message.data) {
         return "Vehicle armed state unavailable or disarmed";
+    }
 
     return {};
 }
@@ -650,11 +673,14 @@ void MotionExecutor::updateExecution()
     {
         std::lock_guard<std::mutex> lock(execution_mutex_);
 
-        if (!execution_)
-            return;
-
         const auto state = getStateSnapshot();
         const auto time = Clock::now();
+
+        // 即使当前没有任务，也持续建立真实悬停观测。
+        updateHoverObservation(state, time);
+
+        if (!execution_)
+            return;
         auto& context = *execution_;
         const auto& status = state.control_status.message;
 
@@ -884,6 +910,152 @@ std::optional<std::uint64_t> MotionExecutor::startExecution(
         std::move(trajectory),
         constraints,
         rejection_reason);
+}
+
+VehicleSnapshot MotionExecutor::buildVehicleSnapshot(
+    const StateSnapshot& state,
+    Clock::time_point time) const
+{
+    VehicleSnapshot result;
+    result.captured_at = time;
+
+    result.connected_valid = statusFresh(state.connected, time);
+    result.connected = state.connected.message.data;
+
+    result.armed_valid = statusFresh(state.armed, time);
+    result.armed = state.armed.message.data;
+
+    result.landed_valid = statusFresh(state.landed, time);
+    result.landed = state.landed.message.data;
+
+    result.position_valid =
+        fresh(state.position, time) &&
+        state.position.message.header.frame_id == "map";
+
+    result.velocity_valid =
+        fresh(state.velocity, time) &&
+        state.velocity.message.header.frame_id == "map";
+
+    result.attitude_valid =
+        fresh(state.attitude, time) &&
+        state.attitude.message.header.frame_id == "map";
+
+    result.control_status_valid =
+        fresh(state.control_status, time);
+
+    const auto& status = state.control_status.message;
+
+    result.control_fault =
+        result.control_status_valid &&
+        (status.state == ControlStatus::FAULT ||
+         status.fault_code != ControlStatus::FAULT_NONE);
+
+    result.control_available =
+        result.control_status_valid &&
+        !result.control_fault;
+
+    result.control_tracking =
+        result.control_available &&
+        status.state == ControlStatus::TRACKING;
+
+    result.control_hover =
+        result.control_available &&
+        status.state == ControlStatus::HOVER &&
+        status.trajectory_id == 0;
+
+    result.execution_active = execution_.has_value();
+
+    result.hover_confirmed =
+        observed_hover_confirmed_ &&
+        result.connected_valid &&
+        result.connected &&
+        result.armed_valid &&
+        result.armed &&
+        result.landed_valid &&
+        !result.landed &&
+        result.position_valid &&
+        result.velocity_valid &&
+        result.attitude_valid &&
+        result.control_hover;
+
+    return result;
+}
+
+VehicleSnapshot MotionExecutor::getVehicleSnapshot() const
+{
+    // 与执行循环保持相同锁顺序：execution → state。
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+
+    const auto state = getStateSnapshot();
+    return buildVehicleSnapshot(state, Clock::now());
+}
+
+void MotionExecutor::updateHoverObservation(
+    const StateSnapshot& state,
+    Clock::time_point time)
+{
+    const auto observation = buildVehicleSnapshot(state, time);
+
+    const bool ready =
+        observation.connected_valid &&
+        observation.connected &&
+        observation.armed_valid &&
+        observation.armed &&
+        observation.landed_valid &&
+        !observation.landed &&
+        observation.position_valid &&
+        observation.velocity_valid &&
+        observation.attitude_valid &&
+        observation.control_hover;
+
+    observed_hover_confirmed_ = false;
+
+    if (!ready) {
+        hover_stable_since_.reset();
+        return;
+    }
+
+    const auto& position = state.position.message.point;
+    const auto& velocity = state.velocity.message.vector;
+    const double yaw = yawOf(state.attitude.message);
+
+    const double speed =
+        std::hypot(velocity.x, velocity.y, velocity.z);
+
+    if (speed > hover_velocity_tolerance_) {
+        hover_stable_since_.reset();
+        return;
+    }
+
+    if (!hover_stable_since_) {
+        hover_stable_since_ = time;
+        hover_anchor_position_ = position;
+        hover_anchor_yaw_ = yaw;
+        return;
+    }
+
+    const double displacement = std::hypot(
+        position.x - hover_anchor_position_.x,
+        position.y - hover_anchor_position_.y,
+        position.z - hover_anchor_position_.z);
+
+    if (displacement > hover_position_tolerance_ ||
+        yawDistance(yaw, hover_anchor_yaw_) >
+            hover_yaw_tolerance_) {
+        hover_stable_since_ = time;
+        hover_anchor_position_ = position;
+        hover_anchor_yaw_ = yaw;
+        return;
+    }
+
+    observed_hover_confirmed_ =
+        std::chrono::duration<double>(
+            time - *hover_stable_since_).count() >=
+                hover_settle_duration_ &&
+        state.position.received_at > *hover_stable_since_ &&
+        state.velocity.received_at > *hover_stable_since_ &&
+        state.attitude.received_at > *hover_stable_since_ &&
+        state.control_status.received_at > *hover_stable_since_;
 }
 
 }  // namespace drone_node::exec

@@ -30,3 +30,10 @@ motion_executor:
       tracking_ack_timeout: 1.0
       hover_ack_timeout: 1.0
       stop_timeout: 5.0
+      # connected、armed、landed 的独立新鲜度门限。
+      status_timeout: 1.5
+    observation:
+      hover_position_tolerance: 0.15
+      hover_yaw_tolerance: 0.10
+      hover_velocity_tolerance: 0.15
+      hover_settle_duration: 0.5

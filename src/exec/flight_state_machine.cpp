@@ -23,6 +23,12 @@ VehicleSnapshot FlightStateMachine::snapshot() const
     return snapshot_;
 }
 
+std::string FlightStateMachine::fault_reason() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return fault_reason_;
+}
+
 bool FlightStateMachine::grounded_confirmed_locked() const
 {
     return snapshot_.connected &&
@@ -169,7 +175,8 @@ TransitionResult FlightStateMachine::process_event(
     // FAULT_DETECTED 可从任意状态触发。
     if (event == FlightEvent::FAULT_DETECTED) {
         phase_ = FlightPhase::FAULT;
-        return accept_locked(previous, "Fault detected");
+        fault_reason_ = "Fault detected";
+        return accept_locked(previous, fault_reason_);
     }
 
     // STATE_RECOVERED 是唯一允许退出 FAULT 的事件。
@@ -181,12 +188,14 @@ TransitionResult FlightStateMachine::process_event(
 
         if (grounded_confirmed_locked()) {
             phase_ = FlightPhase::GROUNDED;
+            fault_reason_.clear();
             return accept_locked(
                 previous, "Recovered to GROUNDED");
         }
 
         if (airborne_control_valid_locked()) {
             phase_ = FlightPhase::HOVERING;
+            fault_reason_.clear();
             return accept_locked(
                 previous, "Recovered to HOVERING");
         }

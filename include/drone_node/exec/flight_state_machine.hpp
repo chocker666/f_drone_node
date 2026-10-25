@@ -1,6 +1,6 @@
-
 #pragma once
 
+#include <chrono>
 #include <mutex>
 #include <string>
 
@@ -14,24 +14,27 @@ class FlightStateMachine
 public:
     FlightStateMachine() = default;
 
-    // 更新观测数据，不自动解除 FAULT。
+    // 更新真实观测，进行启动同步及故障监督。
+    // 不根据观测自动完成正在执行的任务，不自动解除 FAULT。
     void update_snapshot(const VehicleSnapshot& snapshot);
 
-    // 查询当前状态。
     FlightPhase phase() const;
     VehicleSnapshot snapshot() const;
+    std::string fault_reason() const;
 
-    // 判断动作在当前飞行状态下是否合法。
-    // 不负责普通动作互斥，互斥由 ActionManager 处理。
     AdmissionResult check_action(ActionType action) const;
-
-    // 处理飞行状态事件。
     TransitionResult process_event(FlightEvent event);
 
-    // Stop 对所有普通动作具有抢占权限。
     static bool stop_can_preempt(ActionType active_action);
 
 private:
+    bool observation_fresh_locked() const;
+    bool basic_observation_valid_locked() const;
+    bool grounded_confirmed_locked() const;
+    bool flight_feedback_valid_locked() const;
+    bool airborne_control_valid_locked() const;
+    bool hovering_confirmed_locked() const;
+
     AdmissionResult check_action_locked(ActionType action) const;
 
     TransitionResult accept_locked(
@@ -42,16 +45,14 @@ private:
         FlightPhase previous,
         const std::string& reason) const;
 
-    // 判断观测数据是否足以确认飞机在地面。
-    bool grounded_confirmed_locked() const;
-
-    // 判断观测数据是否足以确认飞机在空中且可控。
-    bool airborne_control_valid_locked() const;
-
     mutable std::mutex mutex_;
 
     FlightPhase phase_{FlightPhase::UNKNOWN};
     VehicleSnapshot snapshot_{};
+    std::string fault_reason_;
+
+    // 防止快照更新停止后，上层继续使用旧快照进行准入。
+    const std::chrono::milliseconds snapshot_timeout_{250};
 };
 
 }  // namespace drone_node::exec

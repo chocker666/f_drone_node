@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <chrono>
 
 namespace drone_node::exec
 {
@@ -39,18 +40,36 @@ enum class FlightPhase : std::uint8_t
     FAULT
 };
 
-// 飞机状态的观测信息。
-// 注意：UNKNOWN/FAULT 不应仅由 armed 或 landed 推断解除。
+// MotionExecutor 根据真实缓存和接收时间生成。
+// *_valid 表示对应数据在生成快照时有效且新鲜。
 struct VehicleSnapshot
 {
-    bool connected{false};
-    bool armed{false};
-    bool position_valid{false};
-    bool control_available{false};
+    std::chrono::steady_clock::time_point captured_at{};
 
-    // 是否具有可靠的接地判断。
+    bool connected{false};
+    bool connected_valid{false};
+
+    bool armed{false};
+    bool armed_valid{false};
+
+    bool position_valid{false};
+    bool velocity_valid{false};
+    bool attitude_valid{false};
+
     bool landed_valid{false};
     bool landed{false};
+
+    bool control_status_valid{false};
+    bool control_available{false};
+    bool control_tracking{false};
+    bool control_hover{false};
+    bool control_fault{false};
+
+    // Ctrl HOVER 加上真实位置、Yaw、速度的连续稳定观测。
+    // 不代替任务的执行完成事件。
+    bool hover_confirmed{false};
+
+    bool execution_active{false};
 };
 
 // 状态机接收的事件。

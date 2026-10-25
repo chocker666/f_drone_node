@@ -20,6 +20,7 @@
 #include "drone_node/srv/set_arming.hpp"
 
 #include "drone_node/exec/planner/planner_types.hpp"
+#include "drone_node/exec/action_types.hpp"
 
 
 namespace drone_node::exec
@@ -154,6 +155,9 @@ public:
 
     // 回调在内部锁释放后执行；回调应短小，不阻塞。
     void setExecutionCallback(ExecutionCallback callback);
+
+    // 面向 FSM 的真实观测快照，不改变 FSM 状态。
+    VehicleSnapshot getVehicleSnapshot() const;
 private:
 
     struct ExecutionContext
@@ -224,6 +228,38 @@ private:
     std::optional<ExecutionContext> execution_;
     ExecutionCallback execution_callback_;
     rclcpp::TimerBase::SharedPtr execution_timer_;
+    template<typename MessageT>
+    bool statusFresh(
+        const CachedState<MessageT>& cache,
+        Clock::time_point time) const
+    {
+        return cache.received &&
+               cache.valid &&
+               time >= cache.received_at &&
+               std::chrono::duration<double>(
+                   time - cache.received_at).count() <= status_timeout_;
+    }
+
+    // 以下两个方法在 execution_mutex_ 保护下使用。
+    VehicleSnapshot buildVehicleSnapshot(
+        const StateSnapshot& state,
+        Clock::time_point time) const;
+
+    void updateHoverObservation(
+        const StateSnapshot& state,
+        Clock::time_point time);
+
+    double status_timeout_{1.5};
+
+    double hover_position_tolerance_{0.15};
+    double hover_yaw_tolerance_{0.10};
+    double hover_velocity_tolerance_{0.15};
+    double hover_settle_duration_{0.5};
+
+    std::optional<Clock::time_point> hover_stable_since_;
+    geometry_msgs::msg::Point hover_anchor_position_;
+    double hover_anchor_yaw_{0.0};
+    bool observed_hover_confirmed_{false};
 
     double state_timeout_{0.3};
     double tracking_ack_timeout_{1.0};
