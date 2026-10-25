@@ -1,28 +1,25 @@
-
 #pragma once
 
 #include <chrono>
 #include <cstdint>
-#include <functional>
-#include <memory>
 #include <mutex>
+#include <optional>
+#include <functional>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp_action/rclcpp_action.hpp>
 
-#include "drone_node/action/go_to.hpp"
-#include "drone_node/action/takeoff.hpp"
-#include "drone_node/action/land.hpp"
-#include "drone_node/action/arm.hpp"
-#include "drone_node/action/disarm.hpp"
-#include "drone_node/action/stop.hpp"
+#include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/quaternion_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <std_msgs/msg/bool.hpp>
 
-#include "drone_node/exec/action_manager.hpp"
-#include "drone_node/exec/flight_state_machine.hpp"
-#include "drone_node/exec/planner/motion_planner.hpp"
+#include "drone_node/msg/control_command.hpp"
+#include "drone_node/msg/control_status.hpp"
+#include "drone_node/msg/control_trajectory.hpp"
+#include "drone_node/srv/set_arming.hpp"
+
+
 
 namespace drone_node::exec
 {
@@ -30,133 +27,234 @@ namespace drone_node::exec
 class MotionExecutor : public rclcpp::Node
 {
 public:
-    explicit MotionExecutor(
-        const rclcpp::NodeOptions& options =
-            rclcpp::NodeOptions());
-
-private:
-    using GoalUUID = rclcpp_action::GoalUUID;
     using Clock = std::chrono::steady_clock;
+    using ControlTrajectory = drone_node::msg::ControlTrajectory;
+    using ControlCommand = drone_node::msg::ControlCommand;
+    using ControlStatus = drone_node::msg::ControlStatus;
+    using SetArming = drone_node::srv::SetArming;
+    using ArmClient = rclcpp::Client<SetArming>;
+    using ArmRequest = ArmClient::FutureAndRequestId;
 
-    using GoTo = drone_node::action::GoTo;
-    using Takeoff = drone_node::action::Takeoff;
-    using Land = drone_node::action::Land;
-    using Arm = drone_node::action::Arm;
-    using Disarm = drone_node::action::Disarm;
-    using Stop = drone_node::action::Stop;
-
-    template<typename ActionT>
-    using GoalHandle =
-        rclcpp_action::ServerGoalHandle<ActionT>;
-
-    template<typename ActionT>
-    using Server = rclcpp_action::Server<ActionT>;
-
-    struct GoalBinding
+    template<typename MessageT>
+    struct CachedState
     {
-        ActionId id{0};
-        ActionType type{ActionType::STOP};
-
-        bool attached{false};
-        Clock::time_point started_at{};
-
-        std::function<void(double)> feedback;
-
-        std::function<void(
-            ActionState,
-            const std::string&,
-            bool)> finish;
+        MessageT message{};
+        Clock::time_point received_at{};
+        bool received{false};
+        bool valid{false};
     };
 
-    template<typename ActionT>
-    void create_action_server(
-        const std::string& name,
-        typename Server<ActionT>::SharedPtr& server);
+    struct StateSnapshot
+    {
+        CachedState<geometry_msgs::msg::PointStamped> position;
+        CachedState<geometry_msgs::msg::Vector3Stamped> velocity;
+        CachedState<geometry_msgs::msg::QuaternionStamped> attitude;
+        CachedState<std_msgs::msg::Bool> armed;
+        CachedState<std_msgs::msg::Bool> landed;
+        CachedState<std_msgs::msg::Bool> connected;
+        CachedState<ControlStatus> control_status;
+    };
 
-    template<typename ActionT>
-    rclcpp_action::GoalResponse handle_goal(
-        const GoalUUID& uuid,
-        std::shared_ptr<const typename ActionT::Goal> goal);
+        enum class ExecutionPhase
+    {
+        IDLE,
+        WAITING_TRACKING,
+        TRACKING,
+        WAITING_HOVER
+    };
 
-    template<typename ActionT>
-    rclcpp_action::CancelResponse handle_cancel(
-        const std::shared_ptr<GoalHandle<ActionT>> handle);
+    enum class StopReason
+    {
+        COMPLETED,
+        STOP,
+        CLIENT_CANCEL,
+        FAILURE
+    };
 
-    template<typename ActionT>
-    void handle_accepted(
-        const std::shared_ptr<GoalHandle<ActionT>> handle);
+    enum class ExecutionOutcome
+    {
+        COMPLETED,
+        STOPPED,
+        CANCELED,
+        FAILED
+    };
 
-    template<typename ActionT>
-    bool validate_goal(
-        const typename ActionT::Goal& goal) const;
+    struct ExecutionConstraints
+    {
+        double position_tolerance{0.15};  // m
+        double yaw_tolerance{0.10};       // rad
+        double velocity_tolerance{0.15};  // m/s
+        double settle_duration{0.5};      // s
+        double timeout{30.0};             // s
+    };
 
-    template<typename ActionT>
-    static constexpr ActionType action_type();
+    struct ExecutionEvent
+    {
+        std::uint64_t trajectory_id{0};
+        ExecutionOutcome outcome{ExecutionOutcome::FAILED};
+        StopReason stop_reason{StopReason::FAILURE};
 
-    template<typename ActionT>
-    void attach_goal(
-        ActionId id,
-        const std::shared_ptr<GoalHandle<ActionT>>& handle);
+        // true 只表示已经确认新鲜 HOVER 和稳定状态。
+        bool safe_stop_confirmed{false};
+        std::string message;
+    };
 
-    static std::string uuid_key(const GoalUUID& uuid);
+    struct ExecutionSnapshot
+    {
+        ExecutionPhase phase{ExecutionPhase::IDLE};
+        std::uint64_t trajectory_id{0};
+        StopReason stop_reason{StopReason::COMPLETED};
+        std::string failure;
+    };
 
-    // 第三阶段：GoTo Action -> MotionPlanner。
-    bool plan_goto(
-        ActionId id,
-        const GoTo::Goal& goal);
+    using ExecutionCallback =
+        std::function<void(const ExecutionEvent&)>;
 
-    void update_mock();
-    void process_events();
+    explicit MotionExecutor(
+        const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
 
-    void apply_mock_confirmation(
-        ActionId id,
-        ActionType type,
-        bool canceling);
+    // 仅发布，不等待 Ctrl 确认或轨迹执行完成。
+    void sendTrajectory(const ControlTrajectory& trajectory);
+    void sendCommand(const ControlCommand& command);
 
-    void publish_mock_feedback(
-        ActionId id,
-        double progress);
+    // 返回缓存副本；调用方不持有内部锁或缓存引用。
+    StateSnapshot getStateSnapshot() const;
 
-    typename Server<GoTo>::SharedPtr goto_server_;
-    typename Server<Takeoff>::SharedPtr takeoff_server_;
-    typename Server<Land>::SharedPtr land_server_;
-    typename Server<Arm>::SharedPtr arm_server_;
-    typename Server<Disarm>::SharedPtr disarm_server_;
-    typename Server<Stop>::SharedPtr stop_server_;
+    bool armServiceReady() const;
 
-    std::shared_ptr<FlightStateMachine> fsm_;
-    std::shared_ptr<ActionManager> manager_;
+    // 服务不可用时返回 nullopt；请求发出后立即返回 future 和请求 ID。
+    // future 中的响应仅表示服务结果，不代替实际 armed 状态确认。
+    std::optional<ArmRequest> requestArm(bool arm);
 
-    // 第三阶段：统一规划入口。
-    std::unique_ptr<MotionPlanner> planner_;
+    // 请求被上层放弃或超时后，清理本地 pending request。
+    // 这不会撤销已经发送给 Inter 的请求。
+    bool removePendingArmRequest(std::int64_t request_id);
 
-    rclcpp::TimerBase::SharedPtr mock_timer_;
+        // 第一版只接受 map/ENU POINT。
+    // 成功时分配新的轨迹 ID，并立即发布；返回不代表执行成功。
+    std::optional<std::uint64_t> startExecution(
+        ControlTrajectory trajectory,
+        const ExecutionConstraints& constraints,
+        std::string& rejection_reason);
 
-    // UUID -> ActionId。
-    std::unordered_map<std::string, ActionId> uuid_to_id_;
+    // 仅允许 STOP 或 CLIENT_CANCEL。
+    // 必须提供当前轨迹 ID，避免迟到取消影响下一项任务。
+    bool requestStop(
+        std::uint64_t trajectory_id,
+        StopReason reason);
 
-    // ActionId -> GoalHandle 适配器。
-    std::unordered_map<ActionId, GoalBinding> bindings_;
+    ExecutionSnapshot getExecutionSnapshot() const;
 
-    // 已通过校验并被接受的 GoTo Goal。
-    // 采用值拷贝，避免 Action 生命周期悬空引用。
-    std::unordered_map<ActionId, GoTo::Goal> goto_goals_;
+    // 回调在内部锁释放后执行；回调应短小，不阻塞。
+    void setExecutionCallback(ExecutionCallback callback);
+private:
 
-    // 规划成功的轨迹缓存，供第四阶段 Coordinator 使用。
-    std::unordered_map<ActionId, PlannedMotion> planned_motions_;
+    struct ExecutionContext
+    {
+        ControlTrajectory trajectory;
+        ExecutionConstraints constraints;
 
-    // 保护 Action 和规划缓存。
-    std::mutex mutex_;
+        ExecutionPhase phase{ExecutionPhase::WAITING_TRACKING};
+        StopReason stop_reason{StopReason::COMPLETED};
+        std::string failure;
 
-    double mock_duration_{3.0};
-    double mock_stop_duration_{1.0};
-    double max_descent_speed_{1.0};
-    double action_timeout_{30.0};
+        Clock::time_point started_at{};
+        Clock::time_point phase_started_at{};
+        std::int64_t status_stamp_floor{0};
 
-    std::vector<ActionEvent> deferred_events_;
+        bool hover_confirmed{false};
+        bool stability_started{false};
+        Clock::time_point stable_since{};
 
-    // Mock 状态不代表真实 PX4 观测。
-    VehicleSnapshot mock_snapshot_{};
+        geometry_msgs::msg::Point hover_position;
+        double hover_yaw{0.0};
+    };
+
+    template<typename MessageT>
+    bool fresh(
+        const CachedState<MessageT>& cache,
+        Clock::time_point time) const
+    {
+        return cache.received &&
+               cache.valid &&
+               time >= cache.received_at &&
+               std::chrono::duration<double>(
+                   time - cache.received_at).count() <= state_timeout_;
+    }
+
+    static std::int64_t statusStamp(const ControlStatus& status);
+    static double yawOf(
+        const geometry_msgs::msg::QuaternionStamped& attitude);
+    static double yawDistance(double first, double second);
+    static bool validConstraints(
+        const ExecutionConstraints& constraints);
+
+    std::string stateProblem(
+        const StateSnapshot& state,
+        Clock::time_point time) const;
+
+    bool statusAfter(
+        const StateSnapshot& state,
+        const ExecutionContext& context) const;
+
+    bool settled(
+        ExecutionContext& context,
+        const StateSnapshot& state,
+        Clock::time_point time,
+        bool hover);
+
+    void beginStopping(
+        ExecutionContext& context,
+        const StateSnapshot& state,
+        Clock::time_point time,
+        StopReason reason,
+        const std::string& failure = {});
+
+    ExecutionEvent finishExecution(bool safe_stop_confirmed);
+    void updateExecution();
+
+    mutable std::mutex execution_mutex_;
+    std::optional<ExecutionContext> execution_;
+    ExecutionCallback execution_callback_;
+    rclcpp::TimerBase::SharedPtr execution_timer_;
+
+    double state_timeout_{0.3};
+    double tracking_ack_timeout_{1.0};
+    double hover_ack_timeout_{1.0};
+    double stop_timeout_{5.0};
+
+    template<typename MessageT>
+    void updateCache(
+        CachedState<MessageT>& cache,
+        const MessageT& message,
+        bool valid)
+    {
+        const auto received_at = Clock::now();
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        cache.message = message;
+        cache.received_at = received_at;
+        cache.received = true;
+        cache.valid = valid;
+    }
+
+    mutable std::mutex state_mutex_;
+    StateSnapshot state_;
+
+    rclcpp::Publisher<ControlTrajectory>::SharedPtr trajectory_pub_;
+    rclcpp::Publisher<ControlCommand>::SharedPtr command_pub_;
+
+    rclcpp::Subscription<ControlStatus>::SharedPtr control_status_sub_;
+    rclcpp::Subscription<
+        geometry_msgs::msg::PointStamped>::SharedPtr position_sub_;
+    rclcpp::Subscription<
+        geometry_msgs::msg::Vector3Stamped>::SharedPtr velocity_sub_;
+    rclcpp::Subscription<
+        geometry_msgs::msg::QuaternionStamped>::SharedPtr attitude_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr armed_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr landed_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr connected_sub_;
+
+    ArmClient::SharedPtr arm_client_;
 };
 
 }  // namespace drone_node::exec

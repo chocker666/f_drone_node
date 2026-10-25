@@ -1,3 +1,4 @@
+#include <exception>
 #include <memory>
 
 #include <rclcpp/rclcpp.hpp>
@@ -8,12 +9,26 @@ int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
 
-    auto node =
-        std::make_shared<drone_node::exec::MotionExecutor>();
+    int result = 0;
 
-    rclcpp::spin(node);
+    try {
+        auto motion_executor =
+            std::make_shared<drone_node::exec::MotionExecutor>();
+
+        rclcpp::executors::MultiThreadedExecutor executor(
+            rclcpp::ExecutorOptions(), 2);
+
+        executor.add_node(motion_executor);
+        executor.spin();
+    }
+    catch (const std::exception& error) {
+        RCLCPP_FATAL(
+            rclcpp::get_logger("exec_main"),
+            "Exec failed: %s",
+            error.what());
+        result = 1;
+    }
 
     rclcpp::shutdown();
-
-    return 0;
+    return result;
 }
