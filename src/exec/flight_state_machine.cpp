@@ -1,14 +1,143 @@
-
 #include "drone_node/exec/flight_state_machine.hpp"
 
 namespace drone_node::exec
 {
 
+bool FlightStateMachine::observation_fresh_locked() const
+{
+    const auto now = std::chrono::steady_clock::now();
+
+    return snapshot_.captured_at !=
+               std::chrono::steady_clock::time_point{} &&
+           now >= snapshot_.captured_at &&
+           now - snapshot_.captured_at <= snapshot_timeout_;
+}
+
+bool FlightStateMachine::basic_observation_valid_locked() const
+{
+    return observation_fresh_locked() &&
+           snapshot_.connected_valid &&
+           snapshot_.connected &&
+           snapshot_.armed_valid &&
+           snapshot_.landed_valid;
+}
+
+bool FlightStateMachine::grounded_confirmed_locked() const
+{
+    return basic_observation_valid_locked() &&
+           snapshot_.landed;
+}
+
+bool FlightStateMachine::flight_feedback_valid_locked() const
+{
+    return basic_observation_valid_locked() &&
+           snapshot_.armed &&
+           snapshot_.position_valid &&
+           snapshot_.velocity_valid &&
+           snapshot_.attitude_valid &&
+           snapshot_.control_status_valid &&
+           snapshot_.control_available &&
+           !snapshot_.control_fault;
+}
+
+bool FlightStateMachine::airborne_control_valid_locked() const
+{
+    return flight_feedback_valid_locked() &&
+           !snapshot_.landed;
+}
+
+bool FlightStateMachine::hovering_confirmed_locked() const
+{
+    return airborne_control_valid_locked() &&
+           snapshot_.control_hover &&
+           snapshot_.hover_confirmed &&
+           !snapshot_.execution_active;
+}
+
 void FlightStateMachine::update_snapshot(
     const VehicleSnapshot& snapshot)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // 防止较旧的快照覆盖新观测。
+    if (snapshot.captured_at < snapshot_.captured_at)
+        return;
+
     snapshot_ = snapshot;
+
+    if (phase_ == FlightPhase::FAULT)
+        return;
+
+    const auto fault = [this](const std::string& reason)
+    {
+        phase_ = FlightPhase::FAULT;
+        fault_reason_ = reason;
+    };
+
+    if (snapshot_.control_status_valid &&
+        snapshot_.control_fault) {
+        fault("Ctrl reports FAULT");
+        return;
+    }
+
+    // 启动阶段等待足够观测，不把尚未收到数据当成故障。
+    if (phase_ == FlightPhase::UNKNOWN) {
+        if (!snapshot_.execution_active &&
+            grounded_confirmed_locked()) {
+            phase_ = FlightPhase::GROUNDED;
+        }
+        else if (hovering_confirmed_locked()) {
+            phase_ = FlightPhase::HOVERING;
+        }
+
+        return;
+    }
+
+    if (!basic_observation_valid_locked()) {
+        fault("Connection, armed or landed observation lost");
+        return;
+    }
+
+    switch (phase_) {
+    case FlightPhase::GROUNDED:
+        // 没有 TAKEOFF_STARTED，却观测到离地，不能冒充任务起飞。
+        if (!snapshot_.landed)
+            fault("Unexpected airborne observation while GROUNDED");
+        break;
+
+    case FlightPhase::HOVERING:
+        if (!airborne_control_valid_locked()) {
+            fault("Airborne feedback or control lost");
+        }
+        else if (!snapshot_.control_hover) {
+            fault("Ctrl left HOVER without a flight transition");
+        }
+        break;
+
+    case FlightPhase::MOVING:
+        if (!airborne_control_valid_locked())
+            fault("Airborne feedback or control lost while MOVING");
+        break;
+
+    case FlightPhase::TAKING_OFF:
+    case FlightPhase::LANDING:
+        // 起飞和降落过程中允许 landed 变化。
+        if (!flight_feedback_valid_locked())
+            fault("Flight feedback or control lost");
+        break;
+
+    case FlightPhase::STOPPING:
+        // 已接地时不要求仍然 armed。
+        if (!snapshot_.landed &&
+            !airborne_control_valid_locked()) {
+            fault("Airborne feedback or control lost while STOPPING");
+        }
+        break;
+
+    case FlightPhase::UNKNOWN:
+    case FlightPhase::FAULT:
+        break;
+    }
 }
 
 FlightPhase FlightStateMachine::phase() const
@@ -20,30 +149,28 @@ FlightPhase FlightStateMachine::phase() const
 VehicleSnapshot FlightStateMachine::snapshot() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return snapshot_;
+
+    auto result = snapshot_;
+
+    if (!observation_fresh_locked()) {
+        result.connected_valid = false;
+        result.armed_valid = false;
+        result.landed_valid = false;
+        result.position_valid = false;
+        result.velocity_valid = false;
+        result.attitude_valid = false;
+        result.control_status_valid = false;
+        result.control_available = false;
+        result.hover_confirmed = false;
+    }
+
+    return result;
 }
 
 std::string FlightStateMachine::fault_reason() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return fault_reason_;
-}
-
-bool FlightStateMachine::grounded_confirmed_locked() const
-{
-    return snapshot_.connected &&
-           snapshot_.landed_valid &&
-           snapshot_.landed;
-}
-
-bool FlightStateMachine::airborne_control_valid_locked() const
-{
-    return snapshot_.connected &&
-           snapshot_.armed &&
-           snapshot_.position_valid &&
-           snapshot_.control_available &&
-           snapshot_.landed_valid &&
-           !snapshot_.landed;
 }
 
 AdmissionResult FlightStateMachine::check_action(
@@ -56,85 +183,59 @@ AdmissionResult FlightStateMachine::check_action(
 AdmissionResult FlightStateMachine::check_action_locked(
     ActionType action) const
 {
-    // Stop 是最高优先级软急停。
-    // 即使状态 UNKNOWN 或 FAULT，也允许发出停止请求。
-    // 是否能够实际停止，由后续执行模块确认。
-    if (action == ActionType::STOP) {
+    // 允许请求停止不代表已具备安全停止条件。
+    if (action == ActionType::STOP)
         return {true, "Stop request permitted"};
-    }
 
-    if (phase_ == FlightPhase::FAULT) {
-        return {false, "Vehicle is in FAULT"};
-    }
+    if (phase_ == FlightPhase::FAULT)
+        return {false, "Vehicle is in FAULT: " + fault_reason_};
 
-    if (phase_ == FlightPhase::UNKNOWN) {
+    if (phase_ == FlightPhase::UNKNOWN)
         return {false, "Vehicle phase is UNKNOWN"};
-    }
 
-    if (!snapshot_.connected) {
-        return {false, "PX4 is not connected"};
-    }
+    if (!basic_observation_valid_locked())
+        return {false, "Basic vehicle observation is invalid or stale"};
+
+    if (snapshot_.execution_active)
+        return {false, "Motion execution is active"};
 
     switch (action) {
     case ActionType::ARM:
-        if (phase_ != FlightPhase::GROUNDED) {
-            return {false, "Arm requires GROUNDED"};
-        }
-        if (!grounded_confirmed_locked()) {
-            return {false, "Ground contact is not confirmed"};
-        }
-        if (snapshot_.armed) {
-            return {false, "Vehicle is already armed"};
-        }
-        return {true, "Arm permitted"};
-
     case ActionType::DISARM:
-        if (phase_ != FlightPhase::GROUNDED) {
-            return {false, "Disarm requires GROUNDED"};
+        if (phase_ != FlightPhase::GROUNDED ||
+            !grounded_confirmed_locked()) {
+            return {false, "Arm/Disarm requires confirmed GROUNDED"};
         }
-        if (!grounded_confirmed_locked()) {
-            return {false, "Ground contact is not confirmed"};
-        }
-        if (!snapshot_.armed) {
+
+        if (action == ActionType::ARM && snapshot_.armed)
+            return {false, "Vehicle is already armed"};
+
+        if (action == ActionType::DISARM && !snapshot_.armed)
             return {false, "Vehicle is already disarmed"};
-        }
-        return {true, "Disarm permitted"};
+
+        return {true, "Arm/Disarm permitted"};
 
     case ActionType::TAKEOFF:
-        if (phase_ != FlightPhase::GROUNDED) {
-            return {false, "Takeoff requires GROUNDED"};
+        if (phase_ != FlightPhase::GROUNDED ||
+            !grounded_confirmed_locked()) {
+            return {false, "Takeoff requires confirmed GROUNDED"};
         }
-        if (!grounded_confirmed_locked()) {
-            return {false, "Ground contact is not confirmed"};
+
+        if (!flight_feedback_valid_locked() ||
+            snapshot_.control_tracking) {
+            return {false, "Takeoff requires armed and ready control"};
         }
-        if (!snapshot_.armed) {
-            return {false, "Takeoff requires prior Arm"};
-        }
-        if (!snapshot_.position_valid ||
-            !snapshot_.control_available) {
-            return {false, "Flight control is not ready"};
-        }
+
         return {true, "Takeoff permitted"};
 
     case ActionType::GOTO:
-        if (phase_ != FlightPhase::HOVERING) {
-            return {false, "GoTo requires HOVERING"};
-        }
-        if (!airborne_control_valid_locked()) {
-            return {false, "Airborne control is not valid"};
-        }
-        return {true, "GoTo permitted"};
-
     case ActionType::LAND:
-        // 第一版只允许从 HOVERING 发起普通降落。
-        // MOVING 中需要先 Stop，避免普通 Land 绕过仲裁。
-        if (phase_ != FlightPhase::HOVERING) {
-            return {false, "Land requires HOVERING"};
+        if (phase_ != FlightPhase::HOVERING ||
+            !hovering_confirmed_locked()) {
+            return {false, "GoTo/Land requires confirmed HOVERING"};
         }
-        if (!airborne_control_valid_locked()) {
-            return {false, "Airborne control is not valid"};
-        }
-        return {true, "Land permitted"};
+
+        return {true, "Airborne action permitted"};
 
     case ActionType::STOP:
         return {true, "Stop request permitted"};
@@ -143,12 +244,9 @@ AdmissionResult FlightStateMachine::check_action_locked(
     return {false, "Unsupported action"};
 }
 
-bool FlightStateMachine::stop_can_preempt(
-    ActionType active_action)
+bool FlightStateMachine::stop_can_preempt(ActionType action)
 {
-    // 普通动作均可被 Stop 抢占。
-    // 重复 Stop 由 ActionManager 拒绝或合并。
-    return active_action != ActionType::STOP;
+    return action != ActionType::STOP;
 }
 
 TransitionResult FlightStateMachine::accept_locked(
@@ -169,170 +267,156 @@ TransitionResult FlightStateMachine::process_event(
     FlightEvent event)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto previous = phase_;
 
-    const FlightPhase previous = phase_;
-
-    // FAULT_DETECTED 可从任意状态触发。
     if (event == FlightEvent::FAULT_DETECTED) {
         phase_ = FlightPhase::FAULT;
-        fault_reason_ = "Fault detected";
+
+        if (fault_reason_.empty())
+            fault_reason_ = "Execution fault reported";
+
         return accept_locked(previous, fault_reason_);
     }
 
-    // STATE_RECOVERED 是唯一允许退出 FAULT 的事件。
     if (event == FlightEvent::STATE_RECOVERED) {
-        if (phase_ != FlightPhase::FAULT) {
-            return reject_locked(
-                previous, "Vehicle is not in FAULT");
+        if (phase_ != FlightPhase::FAULT)
+            return reject_locked(previous, "Vehicle is not in FAULT");
+
+        // 仅显式请求恢复；还必须具备真实、可靠的恢复条件。
+        if (snapshot_.execution_active ||
+            !snapshot_.control_status_valid ||
+            !snapshot_.control_available ||
+            snapshot_.control_fault ||
+            snapshot_.control_tracking) {
+            return reject_locked(previous, "Control is not ready for recovery");
         }
 
         if (grounded_confirmed_locked()) {
             phase_ = FlightPhase::GROUNDED;
-            fault_reason_.clear();
-            return accept_locked(
-                previous, "Recovered to GROUNDED");
         }
-
-        if (airborne_control_valid_locked()) {
+        else if (hovering_confirmed_locked()) {
             phase_ = FlightPhase::HOVERING;
-            fault_reason_.clear();
-            return accept_locked(
-                previous, "Recovered to HOVERING");
+        }
+        else {
+            return reject_locked(previous, "Recovery conditions are not met");
         }
 
-        // 恢复事件到达，但尚不能可靠确认飞机状态。
-        // 保持 FAULT，不允许退出。
-        return reject_locked(
-            previous, "Recovery conditions are not met");
+        fault_reason_.clear();
+        return accept_locked(previous, "Explicit recovery confirmed");
     }
 
-    // FAULT 状态禁止任何普通事件修改主状态。
     if (phase_ == FlightPhase::FAULT) {
         return reject_locked(
-            previous,
-            "FAULT can only be cleared by STATE_RECOVERED");
+            previous, "FAULT requires explicit STATE_RECOVERED");
     }
 
     switch (event) {
     case FlightEvent::SYNC_GROUNDED:
-        if (phase_ != FlightPhase::UNKNOWN) {
-            break;
+        if (phase_ == FlightPhase::UNKNOWN &&
+            !snapshot_.execution_active &&
+            grounded_confirmed_locked()) {
+            phase_ = FlightPhase::GROUNDED;
+            return accept_locked(previous, "Synchronized GROUNDED");
         }
-        if (!grounded_confirmed_locked()) {
-            return reject_locked(
-                previous, "Grounded state not confirmed");
-        }
-        phase_ = FlightPhase::GROUNDED;
-        return accept_locked(previous, "Synchronized grounded");
+        break;
 
     case FlightEvent::SYNC_AIRBORNE:
-        if (phase_ != FlightPhase::UNKNOWN) {
-            break;
+        if (phase_ == FlightPhase::UNKNOWN &&
+            hovering_confirmed_locked()) {
+            phase_ = FlightPhase::HOVERING;
+            return accept_locked(previous, "Synchronized HOVERING");
         }
-        if (!airborne_control_valid_locked()) {
-            return reject_locked(
-                previous, "Airborne state not confirmed");
-        }
-        phase_ = FlightPhase::HOVERING;
-        return accept_locked(previous, "Synchronized airborne");
+        break;
 
     case FlightEvent::ARM_CONFIRMED:
-        if (phase_ != FlightPhase::GROUNDED ||
-            !grounded_confirmed_locked() ||
-            !snapshot_.armed) {
-            break;
-        }
-        return accept_locked(previous, "Arm confirmed");
-
     case FlightEvent::DISARM_CONFIRMED:
-        if (phase_ != FlightPhase::GROUNDED ||
-            !grounded_confirmed_locked() ||
-            snapshot_.armed) {
-            break;
+        if (phase_ == FlightPhase::GROUNDED &&
+            grounded_confirmed_locked() &&
+            !snapshot_.execution_active &&
+            snapshot_.armed ==
+                (event == FlightEvent::ARM_CONFIRMED)) {
+            return accept_locked(previous, "Actual armed state confirmed");
         }
-        return accept_locked(previous, "Disarm confirmed");
+        break;
 
     case FlightEvent::TAKEOFF_STARTED:
-        if (!check_action_locked(ActionType::TAKEOFF).accepted) {
-            break;
-        }
-        phase_ = FlightPhase::TAKING_OFF;
-        return accept_locked(previous, "Takeoff started");
+    case FlightEvent::GOTO_STARTED:
+    case FlightEvent::LAND_STARTED: {
+        const auto action =
+            event == FlightEvent::TAKEOFF_STARTED
+                ? ActionType::TAKEOFF
+                : event == FlightEvent::GOTO_STARTED
+                    ? ActionType::GOTO
+                    : ActionType::LAND;
+
+        const auto admission = check_action_locked(action);
+
+        if (!admission.accepted)
+            return reject_locked(previous, admission.reason);
+
+        phase_ =
+            event == FlightEvent::TAKEOFF_STARTED
+                ? FlightPhase::TAKING_OFF
+                : event == FlightEvent::GOTO_STARTED
+                    ? FlightPhase::MOVING
+                    : FlightPhase::LANDING;
+
+        return accept_locked(previous, "Flight action started");
+    }
 
     case FlightEvent::TAKEOFF_COMPLETED:
-        if (phase_ != FlightPhase::TAKING_OFF ||
-            !airborne_control_valid_locked()) {
-            break;
-        }
-        // 目标高度及稳定性应由后续 Monitor 验证。
-        phase_ = FlightPhase::HOVERING;
-        return accept_locked(previous, "Takeoff completed");
+    case FlightEvent::GOTO_COMPLETED: {
+        const auto expected =
+            event == FlightEvent::TAKEOFF_COMPLETED
+                ? FlightPhase::TAKING_OFF
+                : FlightPhase::MOVING;
 
-    case FlightEvent::GOTO_STARTED:
-        if (!check_action_locked(ActionType::GOTO).accepted) {
-            break;
+        // 调用方必须先收到对应任务的正常完成事件。
+        // 此处再检查真实状态，不能单凭 Ctrl HOVER 完成任务。
+        if (phase_ == expected && hovering_confirmed_locked()) {
+            phase_ = FlightPhase::HOVERING;
+            return accept_locked(previous, "Flight action completed");
         }
-        phase_ = FlightPhase::MOVING;
-        return accept_locked(previous, "GoTo started");
-
-    case FlightEvent::GOTO_COMPLETED:
-        if (phase_ != FlightPhase::MOVING ||
-            !airborne_control_valid_locked()) {
-            break;
-        }
-        // 目标位置、速度和姿态容差由 Monitor 验证。
-        phase_ = FlightPhase::HOVERING;
-        return accept_locked(previous, "GoTo completed");
-
-    case FlightEvent::LAND_STARTED:
-        if (!check_action_locked(ActionType::LAND).accepted) {
-            break;
-        }
-        phase_ = FlightPhase::LANDING;
-        return accept_locked(previous, "Land started");
+        break;
+    }
 
     case FlightEvent::LAND_COMPLETED:
-        if (phase_ != FlightPhase::LANDING ||
-            !grounded_confirmed_locked()) {
-            break;
+        if (phase_ == FlightPhase::LANDING &&
+            !snapshot_.execution_active &&
+            grounded_confirmed_locked()) {
+            phase_ = FlightPhase::GROUNDED;
+            return accept_locked(previous, "Landing confirmed");
         }
-        phase_ = FlightPhase::GROUNDED;
-        return accept_locked(previous, "Land completed");
+        break;
 
     case FlightEvent::STOP_STARTED:
-        // STOP 可在任何非 FAULT 状态提出。
-        // UNKNOWN 下允许请求，但不假设已建立悬停。
-        if (phase_ == FlightPhase::STOPPING) {
-            return accept_locked(
-                previous, "Stop already in progress");
-        }
         phase_ = FlightPhase::STOPPING;
-        return accept_locked(previous, "Stop started");
+        return accept_locked(previous, "Stop requested");
 
     case FlightEvent::STOP_HOVER_CONFIRMED:
-        if (phase_ != FlightPhase::STOPPING ||
-            !airborne_control_valid_locked()) {
-            break;
+        if (phase_ == FlightPhase::STOPPING &&
+            hovering_confirmed_locked()) {
+            phase_ = FlightPhase::HOVERING;
+            return accept_locked(previous, "Stopped in confirmed HOVERING");
         }
-        phase_ = FlightPhase::HOVERING;
-        return accept_locked(previous, "Stop hover confirmed");
+        break;
 
     case FlightEvent::STOP_GROUNDED_CONFIRMED:
-        if (phase_ != FlightPhase::STOPPING ||
-            !grounded_confirmed_locked()) {
-            break;
+        if (phase_ == FlightPhase::STOPPING &&
+            !snapshot_.execution_active &&
+            grounded_confirmed_locked()) {
+            phase_ = FlightPhase::GROUNDED;
+            return accept_locked(previous, "Stopped on ground");
         }
-        phase_ = FlightPhase::GROUNDED;
-        return accept_locked(previous, "Stop grounded confirmed");
+        break;
 
     case FlightEvent::FAULT_DETECTED:
     case FlightEvent::STATE_RECOVERED:
-        // 已在 switch 之前处理。
         break;
     }
 
     return reject_locked(
-        previous, "Illegal transition or unmet conditions");
+        previous, "Illegal transition or unconfirmed observation");
 }
 
 }  // namespace drone_node::exec
