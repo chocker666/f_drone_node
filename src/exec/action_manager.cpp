@@ -1,572 +1,697 @@
-
 #include "drone_node/exec/action_manager.hpp"
 
+#include <cmath>
+#include <future>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace drone_node::exec
 {
 
 ActionManager::ActionManager(
-    std::shared_ptr<FlightStateMachine> flight_state_machine)
-    : fsm_(std::move(flight_state_machine))
+    std::shared_ptr<MotionExecutor> motion_executor,
+    std::shared_ptr<FlightStateMachine> flight_state_machine,
+    const rclcpp::NodeOptions& options)
+    : rclcpp::Node("action_manager", options),
+      motion_executor_(std::move(motion_executor)),
+      fsm_(std::move(flight_state_machine))
 {
-    if (!fsm_) {
+    if (!motion_executor_ || !fsm_) {
         throw std::invalid_argument(
-            "ActionManager requires FlightStateMachine");
+            "ActionManager requires MotionExecutor and FSM");
+    }
+
+    const auto positive_parameter = [this](
+        const std::string& name,
+        double default_value)
+    {
+        const double value =
+            declare_parameter<double>(name, default_value);
+
+        if (!std::isfinite(value) || value <= 0.0) {
+            throw std::invalid_argument(
+                name + " must be finite and positive");
+        }
+
+        return value;
+    };
+
+    const double check_frequency = positive_parameter(
+        "check_frequency", 20.0);
+
+    const double feedback_frequency = positive_parameter(
+        "feedback_frequency", 5.0);
+
+    feedback_period_ = 1.0 / feedback_frequency;
+
+    service_wait_timeout_ = positive_parameter(
+        "arm.service_wait_timeout", 3.0);
+
+    response_timeout_ = positive_parameter(
+        "arm.response_timeout", 6.0);
+
+    observation_timeout_ = positive_parameter(
+        "arm.observation_timeout", 2.5);
+
+    action_timeout_ = positive_parameter(
+        "arm.action_timeout", 15.0);
+
+    if (action_timeout_ <=
+        service_wait_timeout_ +
+        response_timeout_ +
+        observation_timeout_) {
+        throw std::invalid_argument(
+            "arm.action_timeout must exceed the sum of "
+            "service_wait_timeout, response_timeout and "
+            "observation_timeout");
+    }
+
+    const auto period =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(1.0 / check_frequency));
+
+    if (period.count() <= 0) {
+        throw std::invalid_argument(
+            "check_frequency is too large");
+    }
+
+    arm_server_ = createServer<Arm>("/drone_node/arm");
+    disarm_server_ = createServer<Disarm>("/drone_node/disarm");
+
+    takeoff_server_ = createServer<Takeoff>("/drone_node/takeoff");
+    goto_server_ = createServer<GoTo>("/drone_node/goto");
+    land_server_ = createServer<Land>("/drone_node/land");
+    stop_server_ = createServer<Stop>("/drone_node/stop");
+
+    timer_ = create_wall_timer(period, [this] { tick(); });
+
+    RCLCPP_INFO(
+        get_logger(),
+        "ActionManager initialized: Arm/Disarm enabled; "
+        "Takeoff/GoTo/Land/Stop goals are rejected");
+}
+
+ActionManager::~ActionManager()
+{
+    try {
+        clearPendingRequest();
+    }
+    catch (...) {
+        // 析构期间不抛出异常。
     }
 }
 
-bool ActionManager::terminal(ActionState state)
+template<typename ActionT>
+typename rclcpp_action::Server<ActionT>::SharedPtr
+ActionManager::createServer(const std::string& name)
 {
-    return state == ActionState::SUCCEEDED ||
-           state == ActionState::CANCELED ||
-           state == ActionState::FAILED;
+    return rclcpp_action::create_server<ActionT>(
+        this,
+        name,
+        [this, name](
+            const GoalUUID& uuid,
+            std::shared_ptr<const typename ActionT::Goal> goal)
+        {
+            (void)goal;
+
+            if constexpr (
+                std::is_same_v<ActionT, Arm> ||
+                std::is_same_v<ActionT, Disarm>) {
+                try {
+                    return handleArmGoal(
+                        uuid, std::is_same_v<ActionT, Arm>);
+                }
+                catch (const std::exception& error) {
+                    RCLCPP_ERROR(
+                        get_logger(),
+                        "%s goal rejected after exception: %s",
+                        name.c_str(),
+                        error.what());
+
+                    return rclcpp_action::GoalResponse::REJECT;
+                }
+            }
+            else {
+                RCLCPP_WARN(
+                    get_logger(),
+                    "%s rejected: not implemented in this stage",
+                    name.c_str());
+
+                return rclcpp_action::GoalResponse::REJECT;
+            }
+        },
+        [this](
+            const std::shared_ptr<
+                rclcpp_action::ServerGoalHandle<ActionT>> handle)
+        {
+            if constexpr (
+                std::is_same_v<ActionT, Arm> ||
+                std::is_same_v<ActionT, Disarm>) {
+                if (!handle->is_active())
+                    return rclcpp_action::CancelResponse::REJECT;
+
+                return handleArmCancel(handle->get_goal_id());
+            }
+            else {
+                return rclcpp_action::CancelResponse::REJECT;
+            }
+        },
+        [this](
+            const std::shared_ptr<
+                rclcpp_action::ServerGoalHandle<ActionT>> handle)
+        {
+            if constexpr (
+                std::is_same_v<ActionT, Arm> ||
+                std::is_same_v<ActionT, Disarm>) {
+                attachArmGoal<ActionT>(handle);
+            }
+            // 未实现 Action 的 Goal 始终被拒绝，
+            // 因此不会进入 accepted 回调。
+        });
 }
 
-bool ActionManager::motion_action(ActionType type)
+rclcpp_action::GoalResponse ActionManager::handleArmGoal(
+    const GoalUUID& uuid,
+    bool desired_arm)
 {
-    return type == ActionType::TAKEOFF ||
-           type == ActionType::LAND ||
-           type == ActionType::GOTO ||
-           type == ActionType::STOP;
-}
+    refreshSnapshot();
 
-void ActionManager::emit_locked(
-    const ActionRecord& record,
-    ActionEventKind kind,
-    const std::string& reason)
-{
-    events_.push_back({
-        record.id,
-        record.type,
-        kind,
-        record.state,
-        reason
-    });
-}
+    // 在 goal 回调中预留执行槽，防止多个 Goal 在
+    // accepted 回调到达前同时通过准入。
+    if (active_) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Arm/Disarm rejected: another action is active");
 
-void ActionManager::finish_locked(
-    ActionRecord& record,
-    ActionState state,
-    const std::string& reason)
-{
-    if (terminal(record.state)) {
-        return;
+        return rclcpp_action::GoalResponse::REJECT;
     }
 
-    record.state = state;
-    record.reason = reason;
+    const auto type = desired_arm
+        ? ActionType::ARM
+        : ActionType::DISARM;
 
-    ActionEventKind kind = ActionEventKind::FAILED;
-
-    if (state == ActionState::SUCCEEDED) {
-        kind = ActionEventKind::SUCCEEDED;
-    } else if (state == ActionState::CANCELED) {
-        kind = ActionEventKind::CANCELED;
-    }
-
-    emit_locked(record, kind, reason);
-
-    if (active_id_ && *active_id_ == record.id) {
-        active_id_.reset();
-    }
-    if (preempted_id_ && *preempted_id_ == record.id) {
-        preempted_id_.reset();
-    }
-    if (canceling_id_ && *canceling_id_ == record.id) {
-        canceling_id_.reset();
-    }
-}
-
-SubmitResult ActionManager::submit(
-    ActionType type,
-    std::chrono::milliseconds timeout)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (timeout.count() <= 0) {
-        return {false, 0, "Timeout must be positive"};
-    }
-
-    // 先进行飞行语义状态准入检查。
     const auto admission = fsm_->check_action(type);
 
     if (!admission.accepted) {
-        return {false, 0, admission.reason};
+        RCLCPP_WARN(
+            get_logger(),
+            "%s rejected: %s",
+            desired_arm ? "Arm" : "Disarm",
+            admission.reason.c_str());
+
+        return rclcpp_action::GoalResponse::REJECT;
     }
 
-    if (type != ActionType::STOP && active_id_) {
-        return {false, 0, "Another action is active"};
+    ArmOperation operation;
+    operation.uuid = uuid;
+    operation.desired_arm = desired_arm;
+    operation.started_at = Clock::now();
+
+    active_.emplace(std::move(operation));
+
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse ActionManager::handleArmCancel(
+    const GoalUUID& uuid)
+{
+    if (!active_ || active_->uuid != uuid)
+        return rclcpp_action::CancelResponse::REJECT;
+
+    // SetArming 无撤回接口。发送后不能把取消请求
+    // 伪装为已经撤销，也不自动发送反向命令。
+    if (active_->request_sent) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Arm/Disarm cancel rejected: "
+            "SetArming request has already been sent");
+
+        return rclcpp_action::CancelResponse::REJECT;
     }
 
-    if (type != ActionType::STOP && canceling_id_) {
-        return {false, 0, "Cancellation is in progress"};
+    active_->cancel_requested = true;
+    return rclcpp_action::CancelResponse::ACCEPT;
+}
+
+template<typename ActionT>
+void ActionManager::attachArmGoal(
+    const std::shared_ptr<
+        rclcpp_action::ServerGoalHandle<ActionT>>& handle)
+{
+    if (!active_ || active_->uuid != handle->get_goal_id()) {
+        auto result = std::make_shared<typename ActionT::Result>();
+        result->success = false;
+        result->error_code =
+            static_cast<std::uint16_t>(ErrorCode::INTERNAL_ERROR);
+        result->message = "Accepted goal has no matching execution slot";
+
+        handle->abort(result);
+        latchFault(result->message);
+        return;
     }
 
-    if (type == ActionType::STOP && active_id_) {
-        const auto& active = records_.at(*active_id_);
+    active_->feedback =
+        [handle](std::uint8_t stage, const std::string& message)
+        {
+            if (!handle->is_executing())
+                return;
 
-        if (!FlightStateMachine::stop_can_preempt(
-                active.type)) {
-            return {false, 0, "Stop is already active"};
-        }
-    }
+            auto feedback =
+                std::make_shared<typename ActionT::Feedback>();
 
-    ActionRecord record;
-    record.id = next_id_++;
-    record.type = type;
-    record.state = ActionState::PENDING;
-    record.created_at = Clock::now();
-    record.timeout = timeout;
+            feedback->stage = stage;
+            feedback->message = message;
 
-    const ActionId new_id = record.id;
+            handle->publish_feedback(feedback);
+        };
 
-    records_.emplace(new_id, record);
+    active_->finish =
+        [handle](
+            ActionState state,
+            ErrorCode error,
+            const std::string& message)
+        {
+            auto result =
+                std::make_shared<typename ActionT::Result>();
 
-    // Stop 抢占所有普通动作。
-    if (type == ActionType::STOP) {
-        if (active_id_) {
-            const ActionId old_id = *active_id_;
-            auto& old = records_.at(old_id);
+            result->success = state == ActionState::SUCCEEDED;
+            result->error_code =
+                static_cast<std::uint16_t>(error);
+            result->message = message;
 
-            if (!terminal(old.state)) {
-                old.state = ActionState::CANCELING;
-                old.reason = "Preempted by Stop";
-
-                emit_locked(
-                    old,
-                    ActionEventKind::PREEMPTED,
-                    old.reason);
-
-                preempted_id_ = old_id;
+            if (state == ActionState::SUCCEEDED) {
+                handle->succeed(result);
             }
-        } else if (canceling_id_) {
-            // 已有普通 Cancel 正在进行时，
-            // Stop 接管停止流程。
-            preempted_id_ = canceling_id_;
+            else if (state == ActionState::CANCELED) {
+                if (!handle->is_canceling()) {
+                    throw std::logic_error(
+                        "Goal is not in CANCELING state");
+                }
+
+                handle->canceled(result);
+            }
+            else {
+                handle->abort(result);
+            }
+        };
+
+    active_->attached = true;
+
+    active_->feedback(
+        0, "Goal accepted; no SetArming request sent yet");
+}
+
+void ActionManager::enqueueExecutionEvent(
+    const MotionExecutor::ExecutionEvent& event)
+{
+    std::lock_guard<std::mutex> lock(event_mutex_);
+    execution_events_.push_back(event);
+}
+
+void ActionManager::processExecutionEvents()
+{
+    std::deque<MotionExecutor::ExecutionEvent> events;
+
+    {
+        std::lock_guard<std::mutex> lock(event_mutex_);
+        events.swap(execution_events_);
+    }
+
+    // 已释放队列锁，之后才访问 FSM 或其他模块。
+    for (const auto& event : events) {
+        if (event.outcome ==
+            MotionExecutor::ExecutionOutcome::FAILED) {
+            latchFault(event.message);
         }
-
-        canceling_id_.reset();
-    }
-
-    active_id_ = new_id;
-
-    emit_locked(
-        records_.at(new_id),
-        ActionEventKind::ACCEPTED,
-        "Action accepted");
-
-    return {true, new_id, "Action accepted"};
-}
-
-bool ActionManager::begin_flight_transition_locked(
-    ActionType type)
-{
-    FlightEvent event;
-
-    switch (type) {
-    case ActionType::TAKEOFF:
-        event = FlightEvent::TAKEOFF_STARTED;
-        break;
-    case ActionType::LAND:
-        event = FlightEvent::LAND_STARTED;
-        break;
-    case ActionType::GOTO:
-        event = FlightEvent::GOTO_STARTED;
-        break;
-    case ActionType::STOP:
-        // FAULT 下仍允许 Stop 作为紧急请求。
-        // 但不能借此退出 FAULT。
-        if (fsm_->phase() == FlightPhase::FAULT) {
-            return true;
-        }
-        event = FlightEvent::STOP_STARTED;
-        break;
-    case ActionType::ARM:
-    case ActionType::DISARM:
-        return true;
-    default:
-        return false;
-    }
-
-    return fsm_->process_event(event).accepted;
-}
-
-bool ActionManager::start(ActionId id)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    auto it = records_.find(id);
-
-    if (it == records_.end() ||
-        !active_id_ ||
-        *active_id_ != id ||
-        it->second.state != ActionState::PENDING) {
-        return false;
-    }
-
-    auto& record = it->second;
-
-    if (!begin_flight_transition_locked(record.type)) {
-        enter_fault_locked(
-            "Unable to begin flight transition");
-        return false;
-    }
-
-    record.state = ActionState::EXECUTING;
-    record.started_at = Clock::now();
-
-    emit_locked(
-        record,
-        ActionEventKind::STARTED,
-        "Action started");
-
-    return true;
-}
-
-bool ActionManager::cancel(ActionId id)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    auto it = records_.find(id);
-
-    if (it == records_.end()) {
-        return false;
-    }
-
-    auto& record = it->second;
-
-    if (terminal(record.state)) {
-        return false;
-    }
-
-    // Stop 是安全停止过程，不接受普通 Cancel 中断。
-    if (record.type == ActionType::STOP) {
-        return false;
-    }
-
-    if (record.state == ActionState::CANCELING) {
-        return true;
-    }
-
-    if (!active_id_ || *active_id_ != id) {
-        return false;
-    }
-
-    // ARM/DISARM 也需要等待取消交接确认，
-    // 避免命令已发送但状态尚未确认的竞态。
-    if (motion_action(record.type)) {
-        const auto transition =
-            fsm_->process_event(FlightEvent::STOP_STARTED);
-
-        if (!transition.accepted) {
-            enter_fault_locked(
-                "Unable to start cancellation stop");
-            return false;
+        else {
+            // 阶段 5 没有已实现的运动 Action。
+            // 不把不属于当前 Arm/Disarm 的执行事件映射为成功。
+            RCLCPP_WARN(
+                get_logger(),
+                "Unbound motion event ignored: trajectory_id=%llu",
+                static_cast<unsigned long long>(
+                    event.trajectory_id));
         }
     }
-
-    record.state = ActionState::CANCELING;
-    record.reason = "Cancellation requested";
-    canceling_id_ = id;
-
-    emit_locked(
-        record,
-        ActionEventKind::CANCEL_REQUESTED,
-        record.reason);
-
-    return true;
 }
 
-bool ActionManager::finish_flight_transition_locked(
-    ActionType type)
+void ActionManager::refreshSnapshot()
 {
-    FlightEvent event;
+    fsm_->update_snapshot(
+        motion_executor_->getVehicleSnapshot());
 
-    switch (type) {
-    case ActionType::ARM:
-        event = FlightEvent::ARM_CONFIRMED;
-        break;
-    case ActionType::DISARM:
-        event = FlightEvent::DISARM_CONFIRMED;
-        break;
-    case ActionType::TAKEOFF:
-        event = FlightEvent::TAKEOFF_COMPLETED;
-        break;
-    case ActionType::LAND:
-        event = FlightEvent::LAND_COMPLETED;
-        break;
-    case ActionType::GOTO:
-        event = FlightEvent::GOTO_COMPLETED;
-        break;
-    case ActionType::STOP:
-        return false;
-    default:
-        return false;
-    }
-
-    return fsm_->process_event(event).accepted;
-}
-
-bool ActionManager::finish_stop_locked(ActionId id)
-{
-    const auto snapshot = fsm_->snapshot();
     const auto phase = fsm_->phase();
 
-    // FAULT 不允许由 Stop 解除。
+    if (phase == logged_phase_)
+        return;
+
+    RCLCPP_INFO(
+        get_logger(),
+        "Flight phase: %s -> %s",
+        to_string(logged_phase_),
+        to_string(phase));
+
     if (phase == FlightPhase::FAULT) {
-        return false;
+        RCLCPP_ERROR(
+            get_logger(),
+            "FSM fault: %s",
+            fsm_->fault_reason().c_str());
     }
 
-    FlightEvent event;
-
-    if (snapshot.connected &&
-        snapshot.landed_valid &&
-        snapshot.landed) {
-        event = FlightEvent::STOP_GROUNDED_CONFIRMED;
-    } else {
-        event = FlightEvent::STOP_HOVER_CONFIRMED;
-    }
-
-    if (!fsm_->process_event(event).accepted) {
-        return false;
-    }
-
-    auto& record = records_.at(id);
-
-    // Stop 抢占的旧动作在停止确认后才算取消完成。
-    if (preempted_id_) {
-        const ActionId old_id = *preempted_id_;
-
-        finish_locked(
-            records_.at(old_id),
-            ActionState::CANCELED,
-            "Preempted and safely stopped");
-    }
-
-    if (canceling_id_) {
-        const ActionId old_id = *canceling_id_;
-
-        finish_locked(
-            records_.at(old_id),
-            ActionState::CANCELED,
-            "Canceled and safely stopped");
-    }
-
-    if (record.type == ActionType::STOP) {
-        finish_locked(
-            record,
-            ActionState::SUCCEEDED,
-            "Stop completed");
-    }
-
-    return true;
+    logged_phase_ = phase;
 }
 
-bool ActionManager::complete(ActionId id)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    auto it = records_.find(id);
-
-    if (it == records_.end() || terminal(it->second.state)) {
-        return false;
-    }
-
-    auto& record = it->second;
-
-    // 被抢占的旧动作不能再以成功结束。
-    if (preempted_id_ && *preempted_id_ == id) {
-        return false;
-    }
-
-    // 普通取消流程收到安全停止确认。
-    if (canceling_id_ && *canceling_id_ == id) {
-        if (motion_action(record.type)) {
-            return finish_stop_locked(id);
-        }
-
-        finish_locked(
-            record,
-            ActionState::CANCELED,
-            "Cancellation confirmed");
-
-        return true;
-    }
-
-    if (!active_id_ ||
-        *active_id_ != id ||
-        record.state != ActionState::EXECUTING) {
-        return false;
-    }
-
-    if (record.type == ActionType::STOP) {
-        return finish_stop_locked(id);
-    }
-
-    if (!finish_flight_transition_locked(record.type)) {
-        return false;
-    }
-
-    finish_locked(
-        record,
-        ActionState::SUCCEEDED,
-        "Action completed");
-
-    return true;
-}
-
-void ActionManager::enter_fault_locked(
-    const std::string& reason)
+void ActionManager::latchFault(const std::string& reason)
 {
     fsm_->process_event(FlightEvent::FAULT_DETECTED);
 
-    // 所有尚未结束的动作均终止。
-    for (auto& entry : records_) {
-        auto& record = entry.second;
-
-        if (!terminal(record.state)) {
-            finish_locked(
-                record,
-                ActionState::FAILED,
-                reason);
-        }
-    }
-
-    active_id_.reset();
-    preempted_id_.reset();
-    canceling_id_.reset();
+    RCLCPP_ERROR(
+        get_logger(),
+        "Fault latched: %s",
+        reason.c_str());
 }
 
-bool ActionManager::fail(
-    ActionId id,
-    const std::string& reason)
+void ActionManager::clearPendingRequest()
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (!active_ || !active_->request)
+        return;
 
-    auto it = records_.find(id);
+    const auto request_id = active_->request->request_id;
 
-    if (it == records_.end() || terminal(it->second.state)) {
-        return false;
+    // 只清理本地 future 关联，不撤销已经发送的服务请求。
+    motion_executor_->removePendingArmRequest(request_id);
+    active_->request.reset();
+}
+
+void ActionManager::finishActive(
+    ActionState state,
+    ErrorCode error,
+    const std::string& message)
+{
+    if (!active_ || !active_->attached)
+        return;
+
+    clearPendingRequest();
+
+    auto finish = std::move(active_->finish);
+    active_.reset();
+
+    try {
+        finish(state, error, message);
+    }
+    catch (const std::exception& exception) {
+        latchFault(
+            std::string("Action terminal delivery failed: ") +
+            exception.what());
     }
 
-    auto& record = it->second;
+    RCLCPP_INFO(
+        get_logger(),
+        "Action terminal state=%d error=%u: %s",
+        static_cast<int>(state),
+        static_cast<unsigned>(error),
+        message.c_str());
+}
 
-    // 旧动作已被 Stop 抢占，其迟到失败事件不应
-    // 覆盖新 Stop 的执行过程。
-    if (preempted_id_ && *preempted_id_ == id) {
-        return false;
+void ActionManager::publishFeedback()
+{
+    if (!active_ || !active_->attached)
+        return;
+
+    const auto now = Clock::now();
+
+    if (now < active_->next_feedback_at)
+        return;
+
+    active_->next_feedback_at =
+        now + std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(feedback_period_));
+
+    const char* message = "";
+
+    switch (active_->phase) {
+    case ArmPhase::WAIT_SERVICE:
+        message = "Waiting for SetArming service; request not sent";
+        break;
+
+    case ArmPhase::WAIT_RESPONSE:
+        message = "SetArming request sent; waiting for service result";
+        break;
+
+    case ArmPhase::WAIT_OBSERVATION:
+        message = "Service succeeded; waiting for actual armed state";
+        break;
     }
 
-    if (motion_action(record.type)) {
-        // 运动执行失败时无法可靠判断是否安全悬停，
-        // 第一版采取保守策略，进入 FAULT。
-        enter_fault_locked(reason);
-        return true;
-    }
-
-    finish_locked(record, ActionState::FAILED, reason);
-    return true;
+    active_->feedback(
+        static_cast<std::uint8_t>(active_->phase),
+        message);
 }
 
 void ActionManager::tick()
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    try {
+        refreshSnapshot();
+        processExecutionEvents();
 
-    const auto now = Clock::now();
+        if (!active_ || !active_->attached)
+            return;
 
-    // 先收集超时动作，避免遍历时反复修改状态。
-    std::vector<ActionId> expired;
-
-    for (const auto& entry : records_) {
-        const auto& record = entry.second;
-
-        if (terminal(record.state)) {
-            continue;
-        }
-
-        const auto elapsed = now - record.created_at;
-
-        if (elapsed >= record.timeout) {
-            expired.push_back(record.id);
-        }
-    }
-
-    for (const ActionId id : expired) {
-        auto it = records_.find(id);
-
-        if (it == records_.end() ||
-            terminal(it->second.state)) {
-            continue;
-        }
-
-        if (motion_action(it->second.type) ||
-            it->second.state == ActionState::CANCELING) {
-            enter_fault_locked("Action timeout");
+        // 故障优先于普通取消或完成。
+        if (fsm_->phase() == FlightPhase::FAULT) {
+            finishActive(
+                ActionState::FAILED,
+                ErrorCode::VEHICLE_FAULT,
+                "FSM is in FAULT: " + fsm_->fault_reason());
             return;
         }
 
-        finish_locked(
-            it->second,
+        tickArm();
+    }
+    catch (const std::exception& error) {
+        const bool request_sent =
+            active_ && active_->request_sent;
+
+        if (request_sent) {
+            latchFault(
+                std::string("Arm/Disarm exception after dispatch: ") +
+                error.what());
+        }
+
+        if (active_ && active_->attached) {
+            finishActive(
+                ActionState::FAILED,
+                ErrorCode::INTERNAL_ERROR,
+                error.what());
+        }
+        else {
+            RCLCPP_ERROR(
+                get_logger(),
+                "ActionManager tick failed: %s",
+                error.what());
+        }
+    }
+}
+
+void ActionManager::tickArm()
+{
+    if (!active_)
+        return;
+
+    const auto now = Clock::now();
+
+    const auto elapsed = [now](Clock::time_point since)
+    {
+        return std::chrono::duration<double>(
+            now - since).count();
+    };
+
+    if (active_->cancel_requested) {
+        finishActive(
+            ActionState::CANCELED,
+            ErrorCode::CANCELED,
+            "Canceled before SetArming request was sent");
+        return;
+    }
+
+    if (elapsed(active_->started_at) >= action_timeout_) {
+        if (active_->request_sent)
+            latchFault("Arm/Disarm total timeout after dispatch");
+
+        finishActive(
             ActionState::FAILED,
-            "Action timeout");
-    }
-}
-
-void ActionManager::report_fault(
-    const std::string& reason)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    enter_fault_locked(reason);
-}
-
-bool ActionManager::recover_flight_state()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // 不允许在动作尚未终止时执行恢复。
-    if (active_id_ || preempted_id_ || canceling_id_) {
-        return false;
+            ErrorCode::TIMEOUT,
+            "Arm/Disarm total timeout");
+        return;
     }
 
-    return fsm_->process_event(
-        FlightEvent::STATE_RECOVERED).accepted;
-}
+    publishFeedback();
 
-std::optional<ActionRecord> ActionManager::get(
-    ActionId id) const
-{
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_->phase == ArmPhase::WAIT_SERVICE) {
+        const auto type = active_->desired_arm
+            ? ActionType::ARM
+            : ActionType::DISARM;
 
-    const auto it = records_.find(id);
+        // 等待服务期间状态可能发生变化，发送前重新准入。
+        const auto admission = fsm_->check_action(type);
 
-    if (it == records_.end()) {
-        return std::nullopt;
+        if (!admission.accepted) {
+            finishActive(
+                ActionState::FAILED,
+                ErrorCode::STATE_REJECTED,
+                "State changed before dispatch: " + admission.reason);
+            return;
+        }
+
+        if (elapsed(active_->started_at) >= service_wait_timeout_) {
+            finishActive(
+                ActionState::FAILED,
+                ErrorCode::SERVICE_UNAVAILABLE,
+                "SetArming service availability timeout");
+            return;
+        }
+
+        if (!motion_executor_->armServiceReady())
+            return;
+
+        active_->sent_at = Clock::now();
+
+        // 若发送过程抛出异常，按可能已发送处理。
+        active_->request_sent = true;
+
+        auto request =
+            motion_executor_->requestArm(active_->desired_arm);
+
+        if (!request) {
+            active_->request_sent = false;
+            return;
+        }
+
+        active_->request.emplace(std::move(*request));
+        active_->phase = ArmPhase::WAIT_RESPONSE;
+
+        RCLCPP_INFO(
+            get_logger(),
+            "SetArming dispatched: arm=%s request_id=%lld",
+            active_->desired_arm ? "true" : "false",
+            static_cast<long long>(
+                active_->request->request_id));
+
+        return;
     }
 
-    return it->second;
-}
+    if (active_->phase == ArmPhase::WAIT_RESPONSE) {
+        if (elapsed(active_->sent_at) >= response_timeout_) {
+            latchFault(
+                "SetArming response timeout; physical result uncertain");
 
-std::optional<ActionId> ActionManager::active_action() const
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    return active_id_;
-}
+            finishActive(
+                ActionState::FAILED,
+                ErrorCode::TIMEOUT,
+                "SetArming response timeout");
+            return;
+        }
 
-std::vector<ActionEvent> ActionManager::drain_events()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
+        if (active_->request->future.wait_for(
+                std::chrono::seconds(0)) !=
+            std::future_status::ready) {
+            return;
+        }
 
-    std::vector<ActionEvent> result;
-    result.reserve(events_.size());
+        const auto response = active_->request->future.get();
+        active_->request.reset();
 
-    while (!events_.empty()) {
-        result.push_back(std::move(events_.front()));
-        events_.pop_front();
+        if (!response || !response->success) {
+            const std::string reason = response
+                ? response->message
+                : "Null SetArming response";
+
+            // 发送后的失败统一采取保守策略，
+            // 不立即接纳可能相反的 Arm/Disarm 请求。
+            latchFault("SetArming failed: " + reason);
+
+            finishActive(
+                ActionState::FAILED,
+                ErrorCode::SERVICE_FAILED,
+                reason);
+            return;
+        }
+
+        active_->response_at = Clock::now();
+        active_->phase = ArmPhase::WAIT_OBSERVATION;
+
+        RCLCPP_INFO(
+            get_logger(),
+            "SetArming service succeeded: %s; "
+            "checking actual armed observation",
+            response->message.c_str());
     }
 
-    return result;
+    if (active_->phase != ArmPhase::WAIT_OBSERVATION)
+        return;
+
+    if (elapsed(active_->response_at) >= observation_timeout_) {
+        latchFault(
+            "Actual armed state confirmation timeout");
+
+        finishActive(
+            ActionState::FAILED,
+            ErrorCode::TIMEOUT,
+            "Actual armed state confirmation timeout");
+        return;
+    }
+
+    // 不只依赖服务响应：必须有请求发出后的真实 armed 消息。
+    const auto raw = motion_executor_->getStateSnapshot();
+
+    refreshSnapshot();
+
+    if (fsm_->phase() == FlightPhase::FAULT) {
+        finishActive(
+            ActionState::FAILED,
+            ErrorCode::VEHICLE_FAULT,
+            "FSM entered FAULT during armed confirmation");
+        return;
+    }
+
+    const auto observation = fsm_->snapshot();
+
+    const bool actual_state_confirmed =
+        raw.armed.received &&
+        raw.armed.valid &&
+        raw.armed.received_at > active_->sent_at &&
+        raw.armed.message.data == active_->desired_arm &&
+        observation.armed_valid &&
+        observation.armed == active_->desired_arm;
+
+    if (!actual_state_confirmed)
+        return;
+
+    const auto event = active_->desired_arm
+        ? FlightEvent::ARM_CONFIRMED
+        : FlightEvent::DISARM_CONFIRMED;
+
+    const auto transition = fsm_->process_event(event);
+
+    if (!transition.accepted) {
+        latchFault(
+            "Armed observation could not confirm FSM transition");
+
+        finishActive(
+            ActionState::FAILED,
+            ErrorCode::STATE_REJECTED,
+            transition.reason);
+        return;
+    }
+
+    active_->feedback(
+        4, "Service succeeded and actual armed state confirmed");
+
+    finishActive(
+        ActionState::SUCCEEDED,
+        ErrorCode::NONE,
+        "SetArming succeeded and actual armed state confirmed");
 }
 
 }  // namespace drone_node::exec

@@ -413,3 +413,61 @@ Action 的最终状态仍以 ROS2 Action 的终止状态为准，`success` 作�
 8. 新 Action 是否需要扩展公共错误码与任务标识机制。
 
 本说明文档作为 Action 接口设计基线，具体 `.action` 消息定义应在对应功能实现前进一步确认。
+
+## Exec 正式版重构：阶段 5 当前行为
+
+当前已实现：
+
+- `/drone_node/arm`
+- `/drone_node/disarm`
+
+以下 Action Server 已注册，但 Goal 明确拒绝：
+
+- `/drone_node/takeoff`
+- `/drone_node/goto`
+- `/drone_node/land`
+- `/drone_node/stop`
+
+拒绝 Goal 不产生已接纳任务的 Result。
+
+### Arm/Disarm 成功条件
+
+1. FSM 允许当前动作。
+2. SetArming 服务响应成功。
+3. 请求发出后收到新鲜、匹配的实际 armed 观测。
+4. FSM 接受 ARM_CONFIRMED 或 DISARM_CONFIRMED。
+
+已处于目标 armed 状态的 Goal 按 FSM 准入规则拒绝。
+
+### Cancel
+
+- SetArming 请求发送前：允许取消，Action 最终为 CANCELED。
+- 请求发送后：拒绝取消，原 Action 继续等待真实结果。
+- 不自动发送反向 Arm/Disarm 命令。
+- 清理本地 pending request 不代表撤回已发送命令。
+
+### Feedback.stage
+
+- 0：Goal 已接纳，尚未发送服务请求。
+- 1：等待服务可用。
+- 2：请求已发送，等待服务结果。
+- 3：服务成功，等待实际 armed 确认。
+- 4：服务与实际状态均已确认。
+
+反馈描述真实执行阶段，不提供模拟百分比。
+
+### Result.error_code
+
+- 0：成功。
+- 1：发送前取消。
+- 2：等待服务可用超时。
+- 3：执行或确认超时。
+- 4：服务返回失败。
+- 5：状态准入或确认被拒绝。
+- 6：FSM 处于 FAULT。
+- 7：内部异常。
+
+请求发送后的失败或超时采用保守策略，Action 为 ABORTED，
+FSM 锁存 FAULT；不会自动重试、反向操作或自动恢复。
+
+正常数据重新到达不会解除 FAULT。

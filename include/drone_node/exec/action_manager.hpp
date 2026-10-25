@@ -1,154 +1,158 @@
-
 #pragma once
 
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
-#include "drone_node/exec/action_types.hpp"
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+
+#include "drone_node/action/arm.hpp"
+#include "drone_node/action/disarm.hpp"
+#include "drone_node/action/go_to.hpp"
+#include "drone_node/action/land.hpp"
+#include "drone_node/action/stop.hpp"
+#include "drone_node/action/takeoff.hpp"
+
 #include "drone_node/exec/flight_state_machine.hpp"
+#include "drone_node/exec/motion_executor.hpp"
 
 namespace drone_node::exec
 {
 
-using ActionId = std::uint64_t;
-
-enum class ActionEventKind : std::uint8_t
-{
-    ACCEPTED,
-    STARTED,
-    CANCEL_REQUESTED,
-    PREEMPTED,
-    SUCCEEDED,
-    CANCELED,
-    FAILED
-};
-
-struct ActionEvent
-{
-    ActionId id{0};
-    ActionType type{ActionType::STOP};
-    ActionEventKind kind{ActionEventKind::FAILED};
-    ActionState state{ActionState::FAILED};
-    std::string reason;
-};
-
-struct ActionRecord
-{
-    ActionId id{0};
-    ActionType type{ActionType::STOP};
-    ActionState state{ActionState::PENDING};
-
-    std::chrono::steady_clock::time_point created_at{};
-    std::chrono::steady_clock::time_point started_at{};
-
-    std::chrono::milliseconds timeout{30000};
-    std::string reason;
-};
-
-struct SubmitResult
-{
-    bool accepted{false};
-    ActionId id{0};
-    std::string reason;
-};
-
-class ActionManager
+class ActionManager : public rclcpp::Node
 {
 public:
     explicit ActionManager(
-        std::shared_ptr<FlightStateMachine> flight_state_machine);
+        std::shared_ptr<MotionExecutor> motion_executor,
+        std::shared_ptr<FlightStateMachine> flight_state_machine,
+        const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
 
-    // 原子准入。Stop 可抢占正在执行的普通动作。
-    SubmitResult submit(
-        ActionType type,
-        std::chrono::milliseconds timeout =
-            std::chrono::milliseconds(30000));
+    ~ActionManager() override;
 
-    // 将 PENDING 动作转为 EXECUTING。
-    bool start(ActionId id);
-
-    // 取消普通动作。
-    // 接受取消不代表已经安全停止。
-    bool cancel(ActionId id);
-
-    // 外部执行器确认动作完成。
-    // 对普通运动动作，需要先完成飞行状态转换。
-    bool complete(ActionId id);
-
-    // 外部执行器报告动作失败。
-    bool fail(ActionId id, const std::string& reason);
-
-    // 处理超时。由外部定时器周期调用。
-    void tick();
-
-    // 全局故障：先使飞行状态机进入 FAULT，
-    // 再终止所有未结束动作。
-    void report_fault(const std::string& reason);
-
-    // 唯一允许请求退出 FAULT 的管理器接口。
-    // 内部仍由 FlightStateMachine 判定是否恢复成功。
-    bool recover_flight_state();
-
-    // 查询动作记录。
-    std::optional<ActionRecord> get(ActionId id) const;
-
-    // 当前拥有执行权的动作。
-    std::optional<ActionId> active_action() const;
-
-    // 获取并清空待处理的生命周期事件。
-    std::vector<ActionEvent> drain_events();
+    // MotionExecutor 可能从另一个节点的回调线程调用。
+    // 这里只入队，不直接操作 GoalHandle 或活动任务。
+    void enqueueExecutionEvent(
+        const MotionExecutor::ExecutionEvent& event);
 
 private:
     using Clock = std::chrono::steady_clock;
+    using GoalUUID = rclcpp_action::GoalUUID;
 
-    static bool terminal(ActionState state);
-    static bool motion_action(ActionType type);
+    using Arm = drone_node::action::Arm;
+    using Disarm = drone_node::action::Disarm;
+    using Takeoff = drone_node::action::Takeoff;
+    using GoTo = drone_node::action::GoTo;
+    using Land = drone_node::action::Land;
+    using Stop = drone_node::action::Stop;
 
-    void emit_locked(
-        const ActionRecord& record,
-        ActionEventKind kind,
-        const std::string& reason);
+    enum class ArmPhase : std::uint8_t
+    {
+        WAIT_SERVICE = 1,
+        WAIT_RESPONSE = 2,
+        WAIT_OBSERVATION = 3
+    };
 
-    void finish_locked(
-        ActionRecord& record,
+    enum class ErrorCode : std::uint16_t
+    {
+        NONE = 0,
+        CANCELED = 1,
+        SERVICE_UNAVAILABLE = 2,
+        TIMEOUT = 3,
+        SERVICE_FAILED = 4,
+        STATE_REJECTED = 5,
+        VEHICLE_FAULT = 6,
+        INTERNAL_ERROR = 7
+    };
+
+    struct ArmOperation
+    {
+        GoalUUID uuid{};
+        bool desired_arm{false};
+        bool attached{false};
+        bool cancel_requested{false};
+        bool request_sent{false};
+
+        ArmPhase phase{ArmPhase::WAIT_SERVICE};
+
+        Clock::time_point started_at{};
+        Clock::time_point sent_at{};
+        Clock::time_point response_at{};
+        Clock::time_point next_feedback_at{};
+
+        std::optional<MotionExecutor::ArmRequest> request;
+
+        std::function<void(std::uint8_t, const std::string&)> feedback;
+
+        std::function<void(
+            ActionState,
+            ErrorCode,
+            const std::string&)> finish;
+    };
+
+    template<typename ActionT>
+    typename rclcpp_action::Server<ActionT>::SharedPtr createServer(
+        const std::string& name);
+
+    rclcpp_action::GoalResponse handleArmGoal(
+        const GoalUUID& uuid,
+        bool desired_arm);
+
+    rclcpp_action::CancelResponse handleArmCancel(
+        const GoalUUID& uuid);
+
+    template<typename ActionT>
+    void attachArmGoal(
+        const std::shared_ptr<
+            rclcpp_action::ServerGoalHandle<ActionT>>& handle);
+
+    void tick();
+    void tickArm();
+
+    void refreshSnapshot();
+    void processExecutionEvents();
+
+    void publishFeedback();
+    void clearPendingRequest();
+
+    void finishActive(
         ActionState state,
-        const std::string& reason);
+        ErrorCode error,
+        const std::string& message);
 
-    bool begin_flight_transition_locked(ActionType type);
+    void latchFault(const std::string& reason);
 
-    bool finish_flight_transition_locked(ActionType type);
-
-    // Stop 或 Cancel 的停止确认。
-    bool finish_stop_locked(ActionId id);
-
-    // 停止失败时，进入 FAULT 并终止所有动作。
-    void enter_fault_locked(const std::string& reason);
-
+    std::shared_ptr<MotionExecutor> motion_executor_;
     std::shared_ptr<FlightStateMachine> fsm_;
 
-    mutable std::mutex mutex_;
+    rclcpp_action::Server<Arm>::SharedPtr arm_server_;
+    rclcpp_action::Server<Disarm>::SharedPtr disarm_server_;
+    rclcpp_action::Server<Takeoff>::SharedPtr takeoff_server_;
+    rclcpp_action::Server<GoTo>::SharedPtr goto_server_;
+    rclcpp_action::Server<Land>::SharedPtr land_server_;
+    rclcpp_action::Server<Stop>::SharedPtr stop_server_;
 
-    ActionId next_id_{1};
+    rclcpp::TimerBase::SharedPtr timer_;
 
-    std::unordered_map<ActionId, ActionRecord> records_;
+    // 所有 Action 回调和管理定时器都使用本节点默认互斥回调组。
+    // 因而 active_ 不会被这些回调并发访问。
+    std::optional<ArmOperation> active_;
+    FlightPhase logged_phase_{FlightPhase::UNKNOWN};
 
-    // 当前拥有控制权的动作。
-    std::optional<ActionId> active_id_;
+    // 跨节点执行事件单独通过互斥队列传递。
+    std::mutex event_mutex_;
+    std::deque<MotionExecutor::ExecutionEvent> execution_events_;
 
-    // Stop 抢占的旧动作，等待安全停止后终结。
-    std::optional<ActionId> preempted_id_;
-
-    // 普通 Cancel 正在等待停止确认。
-    std::optional<ActionId> canceling_id_;
-
-    std::deque<ActionEvent> events_;
+    double service_wait_timeout_{3.0};
+    double response_timeout_{6.0};
+    double observation_timeout_{2.5};
+    double action_timeout_{15.0};
+    double feedback_period_{0.2};
 };
 
 }  // namespace drone_node::exec

@@ -37,3 +37,13 @@ motion_executor:
       hover_yaw_tolerance: 0.10
       hover_velocity_tolerance: 0.15
       hover_settle_duration: 0.5
+action_manager:
+  ros__parameters:
+    check_frequency: 20.0
+    feedback_frequency: 5.0
+
+    arm:
+      service_wait_timeout: 3.0
+      response_timeout: 6.0
+      observation_timeout: 2.5
+      action_timeout: 15.0
