@@ -1,14 +1,32 @@
 #include "drone_node/exec/action_manager.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <future>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-#include <algorithm>
 
 namespace drone_node::exec
 {
+
+namespace
+{
+
+template<typename CacheT>
+bool freshCache(
+    const CacheT& cache,
+    std::chrono::steady_clock::time_point now,
+    double timeout)
+{
+    return cache.received &&
+           cache.valid &&
+           now >= cache.received_at &&
+           std::chrono::duration<double>(
+               now - cache.received_at).count() <= timeout;
+}
+
+}  // namespace
 
 ActionManager::ActionManager(
     std::shared_ptr<MotionExecutor> motion_executor,
@@ -61,12 +79,53 @@ ActionManager::ActionManager(
 
     takeoff_constraints_.require_airborne = true;
 
-    if (takeoff_constraints_.yaw_tolerance > std::acos(-1.0) ||
-        takeoff_constraints_.timeout <=
-            takeoff_constraints_.settle_duration) {
-        throw std::invalid_argument(
-            "Invalid Takeoff yaw tolerance or timeout");
-    }
+    goto_constraints_.position_tolerance = positive_parameter(
+        "goto.position_tolerance", 0.15);
+
+    goto_constraints_.yaw_tolerance = positive_parameter(
+        "goto.yaw_tolerance", 0.10);
+
+    goto_constraints_.velocity_tolerance = positive_parameter(
+        "goto.velocity_tolerance", 0.15);
+
+    goto_constraints_.settle_duration = positive_parameter(
+        "goto.settle_duration", 0.5);
+
+    goto_constraints_.timeout = positive_parameter(
+        "goto.timeout", 30.0);
+
+    goto_confirmation_timeout_ = positive_parameter(
+        "goto.confirmation_timeout", 2.0);
+
+    goto_constraints_.require_airborne = true;
+
+    const double stop_timeout =
+        motion_executor_->get_parameter(
+            "execution.stop_timeout").as_double();
+
+    const double hover_ack_timeout =
+        motion_executor_->get_parameter(
+            "execution.hover_ack_timeout").as_double();
+
+    const auto validate_constraints = [
+        stop_timeout,
+        hover_ack_timeout
+    ](
+        const MotionExecutor::ExecutionConstraints& constraints,
+        const std::string& name)
+    {
+        if (constraints.yaw_tolerance > std::acos(-1.0) ||
+            constraints.timeout <= constraints.settle_duration ||
+            stop_timeout <=
+                hover_ack_timeout + constraints.settle_duration) {
+            throw std::invalid_argument(
+                "Invalid " + name +
+                " tolerance, execution or stop timeout");
+        }
+    };
+
+    validate_constraints(takeoff_constraints_, "Takeoff");
+    validate_constraints(goto_constraints_, "GoTo");
 
     const double check_frequency = positive_parameter(
         "check_frequency", 20.0);
@@ -109,18 +168,18 @@ ActionManager::ActionManager(
 
     arm_server_ = createServer<Arm>("/drone_node/arm");
     disarm_server_ = createServer<Disarm>("/drone_node/disarm");
-
     takeoff_server_ = createServer<Takeoff>("/drone_node/takeoff");
     goto_server_ = createServer<GoTo>("/drone_node/goto");
     land_server_ = createServer<Land>("/drone_node/land");
     stop_server_ = createServer<Stop>("/drone_node/stop");
 
-    timer_ = create_wall_timer(period, [this] { tick(); });
+    timer_ = create_wall_timer(
+        period, [this] { tick(); });
 
     RCLCPP_INFO(
         get_logger(),
-        "ActionManager initialized: Arm/Disarm/Takeoff enabled; "
-        "GoTo/Land/Stop goals are rejected");
+        "ActionManager initialized: Arm/Disarm/Takeoff/GoTo enabled; "
+        "Land/Stop goals are rejected");
 }
 
 ActionManager::~ActionManager()
@@ -155,6 +214,10 @@ ActionManager::createServer(const std::string& name)
                     std::is_same_v<ActionT, Takeoff>) {
                     return handleTakeoffGoal(uuid, *goal);
                 }
+                else if constexpr (
+                    std::is_same_v<ActionT, GoTo>) {
+                    return handleGoToGoal(uuid, *goal);
+                }
                 else {
                     RCLCPP_WARN(
                         get_logger(),
@@ -187,8 +250,9 @@ ActionManager::createServer(const std::string& name)
                 return handleArmCancel(handle->get_goal_id());
             }
             else if constexpr (
-                std::is_same_v<ActionT, Takeoff>) {
-                return handleTakeoffCancel(handle->get_goal_id());
+                std::is_same_v<ActionT, Takeoff> ||
+                std::is_same_v<ActionT, GoTo>) {
+                return handleMotionCancel(handle->get_goal_id());
             }
             else {
                 return rclcpp_action::CancelResponse::REJECT;
@@ -204,8 +268,9 @@ ActionManager::createServer(const std::string& name)
                 attachArmGoal<ActionT>(handle);
             }
             else if constexpr (
-                std::is_same_v<ActionT, Takeoff>) {
-                attachTakeoffGoal(handle);
+                std::is_same_v<ActionT, Takeoff> ||
+                std::is_same_v<ActionT, GoTo>) {
+                attachMotionGoal<ActionT>(handle);
             }
         });
 }
@@ -216,12 +281,11 @@ rclcpp_action::GoalResponse ActionManager::handleArmGoal(
 {
     refreshSnapshot();
 
-    // 在 goal 回调中预留执行槽，防止多个 Goal 在
-    // accepted 回调到达前同时通过准入。
-    if (active_ || takeoff_) {
+    // 在 Goal 回调中预留任务槽，避免 accepted 回调前重复接纳。
+    if (active_ || motion_) {
         RCLCPP_WARN(
             get_logger(),
-            "Arm/Disarm rejected: another action is active");
+            "Arm/Disarm rejected: another task is active");
 
         return rclcpp_action::GoalResponse::REJECT;
     }
@@ -258,8 +322,7 @@ rclcpp_action::CancelResponse ActionManager::handleArmCancel(
     if (!active_ || active_->uuid != uuid)
         return rclcpp_action::CancelResponse::REJECT;
 
-    // SetArming 无撤回接口。发送后不能把取消请求
-    // 伪装为已经撤销，也不自动发送反向命令。
+    // SetArming 没有撤回接口，不发送反向命令冒充取消。
     if (active_->request_sent) {
         RCLCPP_WARN(
             get_logger(),
@@ -270,6 +333,7 @@ rclcpp_action::CancelResponse ActionManager::handleArmCancel(
     }
 
     active_->cancel_requested = true;
+
     return rclcpp_action::CancelResponse::ACCEPT;
 }
 
@@ -291,7 +355,9 @@ void ActionManager::attachArmGoal(
     }
 
     active_->feedback =
-        [handle](std::uint8_t stage, const std::string& message)
+        [handle](
+            std::uint8_t stage,
+            const std::string& message)
         {
             if (!handle->is_executing())
                 return;
@@ -341,6 +407,208 @@ void ActionManager::attachArmGoal(
         0, "Goal accepted; no SetArming request sent yet");
 }
 
+rclcpp_action::GoalResponse ActionManager::handleTakeoffGoal(
+    const GoalUUID& uuid,
+    const Takeoff::Goal& goal)
+{
+    refreshSnapshot();
+
+    if (active_ || motion_) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Takeoff rejected: another task is active");
+
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    if (!std::isfinite(goal.height) || goal.height < 0.0) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Takeoff rejected: height must be finite and >= 0");
+
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    const auto admission =
+        fsm_->check_action(ActionType::TAKEOFF);
+
+    if (!admission.accepted) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Takeoff rejected: %s",
+            admission.reason.c_str());
+
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    MotionOperation operation;
+    operation.uuid = uuid;
+    operation.type = ActionType::TAKEOFF;
+
+    operation.height = goal.height == 0.0
+        ? takeoff_default_height_
+        : goal.height;
+
+    operation.constraints = takeoff_constraints_;
+    operation.confirmation_timeout =
+        takeoff_confirmation_timeout_;
+
+    motion_.emplace(std::move(operation));
+
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::GoalResponse ActionManager::handleGoToGoal(
+    const GoalUUID& uuid,
+    const GoTo::Goal& goal)
+{
+    refreshSnapshot();
+
+    if (active_ || motion_) {
+        RCLCPP_WARN(
+            get_logger(),
+            "GoTo rejected: another task is active");
+
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    if (goal.header.frame_id != "map" ||
+        !std::isfinite(goal.position.x) ||
+        !std::isfinite(goal.position.y) ||
+        !std::isfinite(goal.position.z) ||
+        !std::isfinite(goal.yaw)) {
+        RCLCPP_WARN(
+            get_logger(),
+            "GoTo rejected: requires finite map/ENU position and yaw");
+
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    const auto admission =
+        fsm_->check_action(ActionType::GOTO);
+
+    if (!admission.accepted) {
+        RCLCPP_WARN(
+            get_logger(),
+            "GoTo rejected: %s",
+            admission.reason.c_str());
+
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    MotionOperation operation;
+    operation.uuid = uuid;
+    operation.type = ActionType::GOTO;
+    operation.constraints = goto_constraints_;
+    operation.confirmation_timeout =
+        goto_confirmation_timeout_;
+
+    operation.request.planner_type = PlannerType::FIXED;
+    operation.request.frame_id = "map";
+
+    operation.request.target_position = Eigen::Vector3d(
+        goal.position.x,
+        goal.position.y,
+        goal.position.z);
+
+    operation.request.target_yaw = goal.yaw;
+    operation.request.yaw_direction = 0;
+    operation.request.controller_id = "position_yaw_pid";
+    operation.request.config_name = "default";
+
+    motion_.emplace(std::move(operation));
+
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse ActionManager::handleMotionCancel(
+    const GoalUUID& uuid)
+{
+    if (!motion_ || motion_->uuid != uuid)
+        return rclcpp_action::CancelResponse::REJECT;
+
+    // 接受取消仅表示记录放弃任务的意图。
+    // 发布后的任务必须等待真实安全停止确认。
+    motion_->cancel_requested = true;
+
+    return rclcpp_action::CancelResponse::ACCEPT;
+}
+
+template<typename ActionT>
+void ActionManager::attachMotionGoal(
+    const std::shared_ptr<
+        rclcpp_action::ServerGoalHandle<ActionT>>& handle)
+{
+    if (!motion_ || motion_->uuid != handle->get_goal_id()) {
+        auto result = std::make_shared<typename ActionT::Result>();
+        result->success = false;
+        result->error_code =
+            static_cast<std::uint16_t>(ErrorCode::INTERNAL_ERROR);
+        result->message = "Accepted motion goal has no matching slot";
+
+        handle->abort(result);
+        latchFault(result->message);
+        return;
+    }
+
+    motion_->feedback =
+        [handle](
+            const std::string& phase,
+            float progress,
+            double value)
+        {
+            if (!handle->is_executing())
+                return;
+
+            auto feedback =
+                std::make_shared<typename ActionT::Feedback>();
+
+            feedback->phase = phase;
+            feedback->progress = progress;
+
+            if constexpr (std::is_same_v<ActionT, Takeoff>) {
+                feedback->current_height = value;
+            }
+            else if constexpr (std::is_same_v<ActionT, GoTo>) {
+                feedback->remaining_distance = value;
+            }
+
+            handle->publish_feedback(feedback);
+        };
+
+    motion_->finish =
+        [handle](
+            ActionState state,
+            ErrorCode error,
+            const std::string& message)
+        {
+            auto result =
+                std::make_shared<typename ActionT::Result>();
+
+            result->success = state == ActionState::SUCCEEDED;
+            result->error_code =
+                static_cast<std::uint16_t>(error);
+            result->message = message;
+
+            if (state == ActionState::SUCCEEDED) {
+                handle->succeed(result);
+            }
+            else if (state == ActionState::CANCELED) {
+                if (!handle->is_canceling()) {
+                    throw std::logic_error(
+                        "Motion goal is not CANCELING");
+                }
+
+                handle->canceled(result);
+            }
+            else {
+                handle->abort(result);
+            }
+        };
+
+    motion_->attached = true;
+}
+
 void ActionManager::enqueueExecutionEvent(
     const MotionExecutor::ExecutionEvent& event)
 {
@@ -357,12 +625,11 @@ void ActionManager::processExecutionEvents()
         events.swap(execution_events_);
     }
 
+    // 释放队列锁后再处理其他模块。
     for (const auto& event : events) {
-        // 所有事件都必须匹配当前任务的轨迹 ID。
-        // 迟到的旧事件，包括失败事件，不得终止新任务。
-        if (!takeoff_ ||
-            !takeoff_->trajectory_id ||
-            *takeoff_->trajectory_id != event.trajectory_id) {
+        if (!motion_ ||
+            !motion_->trajectory_id ||
+            *motion_->trajectory_id != event.trajectory_id) {
             RCLCPP_WARN(
                 get_logger(),
                 "Unbound motion event ignored: trajectory_id=%llu",
@@ -371,17 +638,17 @@ void ActionManager::processExecutionEvents()
             continue;
         }
 
-        // 重复事件不覆盖已有结果；异常结果优先。
-        if (!takeoff_->terminal_event ||
+        // 重复普通事件不延长确认期限；失败事件优先。
+        if (!motion_->terminal_event ||
             event.outcome ==
                 MotionExecutor::ExecutionOutcome::FAILED) {
-            takeoff_->terminal_event = event;
-            takeoff_->event_received_at = Clock::now();
+            motion_->terminal_event = event;
+            motion_->event_received_at = Clock::now();
         }
 
         if (event.outcome ==
             MotionExecutor::ExecutionOutcome::FAILED) {
-            takeoff_->failure = event.message;
+            motion_->failure = event.message;
             latchFault(event.message);
         }
     }
@@ -430,7 +697,7 @@ void ActionManager::clearPendingRequest()
 
     const auto request_id = active_->request->request_id;
 
-    // 只清理本地 future 关联，不撤销已经发送的服务请求。
+    // 只清理本地关联，不撤销已经发送的服务请求。
     motion_executor_->removePendingArmRequest(request_id);
     active_->request.reset();
 }
@@ -443,13 +710,15 @@ void ActionManager::finishActive(
     if (!active_ || !active_->attached)
         return;
 
+    const std::string text = message;
+
     clearPendingRequest();
 
     auto finish = std::move(active_->finish);
     active_.reset();
 
     try {
-        finish(state, error, message);
+        finish(state, error, text);
     }
     catch (const std::exception& exception) {
         latchFault(
@@ -462,7 +731,38 @@ void ActionManager::finishActive(
         "Action terminal state=%d error=%u: %s",
         static_cast<int>(state),
         static_cast<unsigned>(error),
-        message.c_str());
+        text.c_str());
+}
+
+void ActionManager::finishMotion(
+    ActionState state,
+    ErrorCode error,
+    const std::string& message)
+{
+    if (!motion_ || !motion_->attached)
+        return;
+
+    // message 可能引用任务内的 failure，先复制再释放任务。
+    const std::string text = message;
+    auto finish = std::move(motion_->finish);
+
+    motion_.reset();
+
+    try {
+        finish(state, error, text);
+    }
+    catch (const std::exception& exception) {
+        latchFault(
+            std::string("Motion terminal delivery failed: ") +
+            exception.what());
+    }
+
+    RCLCPP_INFO(
+        get_logger(),
+        "Motion terminal state=%d error=%u: %s",
+        static_cast<int>(state),
+        static_cast<unsigned>(error),
+        text.c_str());
 }
 
 void ActionManager::publishFeedback()
@@ -500,23 +800,115 @@ void ActionManager::publishFeedback()
         message);
 }
 
+void ActionManager::publishMotionFeedback()
+{
+    if (!motion_ || !motion_->trajectory_id)
+        return;
+
+    const auto now = Clock::now();
+
+    if (now < motion_->next_feedback_at)
+        return;
+
+    motion_->next_feedback_at =
+        now + std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(feedback_period_));
+
+    const auto raw = motion_executor_->getStateSnapshot();
+
+    const double state_timeout =
+        motion_executor_->get_parameter(
+            "execution.state_timeout").as_double();
+
+    if (!freshCache(raw.position, now, state_timeout) ||
+        raw.position.message.header.frame_id != "map") {
+        return;
+    }
+
+    std::string phase;
+
+    if (motion_->terminal_event) {
+        phase = "WAITING_FSM_CONFIRMATION";
+    }
+    else {
+        switch (motion_executor_->getExecutionSnapshot().phase) {
+        case MotionExecutor::ExecutionPhase::WAITING_TRACKING:
+            phase = "WAITING_TRACKING";
+            break;
+
+        case MotionExecutor::ExecutionPhase::TRACKING:
+            phase = "TRACKING";
+            break;
+
+        case MotionExecutor::ExecutionPhase::WAITING_HOVER:
+            phase = "WAITING_HOVER";
+            break;
+
+        case MotionExecutor::ExecutionPhase::IDLE:
+            phase = "WAITING_EXECUTION_EVENT";
+            break;
+        }
+    }
+
+    const auto& position = raw.position.message.point;
+
+    double value = 0.0;
+    double progress = 0.0;
+
+    if (motion_->type == ActionType::TAKEOFF) {
+        value = position.z - motion_->start_z;
+
+        progress = std::clamp(
+            value / motion_->height,
+            0.0,
+            1.0);
+    }
+    else {
+        const auto& target = motion_->motion.target_position;
+
+        value = std::hypot(
+            position.x - target.x(),
+            position.y - target.y(),
+            position.z - target.z());
+
+        if (motion_->initial_distance > 1.0e-9) {
+            progress = std::clamp(
+                1.0 - value / motion_->initial_distance,
+                0.0,
+                1.0);
+        }
+        else {
+            // 位置相同仍然需要确认 Yaw、稳定和 HOVER。
+            progress =
+                value <= motion_->constraints.position_tolerance
+                    ? 1.0
+                    : 0.0;
+        }
+    }
+
+    motion_->feedback(
+        phase,
+        static_cast<float>(progress),
+        value);
+}
+
 void ActionManager::tick()
 {
     try {
         refreshSnapshot();
         processExecutionEvents();
 
-        if (takeoff_) {
-            if (!takeoff_->attached)
+        if (motion_) {
+            if (!motion_->attached)
                 return;
 
             if (fsm_->phase() == FlightPhase::FAULT &&
-                takeoff_->failure.empty()) {
-                takeoff_->failure =
+                motion_->failure.empty()) {
+                motion_->failure =
                     "FSM is in FAULT: " + fsm_->fault_reason();
             }
 
-            tickTakeoff();
+            tickMotion();
             return;
         }
 
@@ -534,25 +926,25 @@ void ActionManager::tick()
         tickArm();
     }
     catch (const std::exception& error) {
-        if (takeoff_ && takeoff_->attached) {
-            if (takeoff_->trajectory_id) {
+        if (motion_ && motion_->attached) {
+            if (motion_->trajectory_id) {
                 try {
                     motion_executor_->requestStop(
-                        *takeoff_->trajectory_id,
+                        *motion_->trajectory_id,
                         MotionExecutor::StopReason::CLIENT_CANCEL);
                 }
                 catch (...) {
-                    // 继续锁存故障，不宣称已经安全停止。
+                    // 继续报告故障，不宣称已安全停止。
                 }
             }
 
-            if (takeoff_->fsm_started) {
+            if (motion_->fsm_started) {
                 latchFault(
-                    std::string("Takeoff exception: ") +
+                    std::string("Motion exception: ") +
                     error.what());
             }
 
-            finishTakeoff(
+            finishMotion(
                 ActionState::FAILED,
                 ErrorCode::INTERNAL_ERROR,
                 error.what());
@@ -588,12 +980,10 @@ void ActionManager::tickArm()
     if (!active_)
         return;
 
-    const auto now = Clock::now();
-
-    const auto elapsed = [now](Clock::time_point since)
+    const auto elapsed = [](Clock::time_point since)
     {
         return std::chrono::duration<double>(
-            now - since).count();
+            Clock::now() - since).count();
     };
 
     if (active_->cancel_requested) {
@@ -622,7 +1012,6 @@ void ActionManager::tickArm()
             ? ActionType::ARM
             : ActionType::DISARM;
 
-        // 等待服务期间状态可能发生变化，发送前重新准入。
         const auto admission = fsm_->check_action(type);
 
         if (!admission.accepted) {
@@ -646,7 +1035,7 @@ void ActionManager::tickArm()
 
         active_->sent_at = Clock::now();
 
-        // 若发送过程抛出异常，按可能已发送处理。
+        // 发送异常时保守地按可能已经发送处理。
         active_->request_sent = true;
 
         auto request =
@@ -696,8 +1085,6 @@ void ActionManager::tickArm()
                 ? response->message
                 : "Null SetArming response";
 
-            // 发送后的失败统一采取保守策略，
-            // 不立即接纳可能相反的 Arm/Disarm 请求。
             latchFault("SetArming failed: " + reason);
 
             finishActive(
@@ -721,8 +1108,7 @@ void ActionManager::tickArm()
         return;
 
     if (elapsed(active_->response_at) >= observation_timeout_) {
-        latchFault(
-            "Actual armed state confirmation timeout");
+        latchFault("Actual armed state confirmation timeout");
 
         finishActive(
             ActionState::FAILED,
@@ -731,7 +1117,6 @@ void ActionManager::tickArm()
         return;
     }
 
-    // 不只依赖服务响应：必须有请求发出后的真实 armed 消息。
     const auto raw = motion_executor_->getStateSnapshot();
 
     refreshSnapshot();
@@ -783,7 +1168,6 @@ void ActionManager::tickArm()
         "SetArming succeeded and actual armed state confirmed");
 }
 
-
 double ActionManager::measuredYaw(
     const geometry_msgs::msg::QuaternionStamped& attitude)
 {
@@ -803,122 +1187,18 @@ double ActionManager::measuredYaw(
         1.0 - 2.0 * (y * y + z * z));
 }
 
-rclcpp_action::GoalResponse ActionManager::handleTakeoffGoal(
-    const GoalUUID& uuid,
-    const Takeoff::Goal& goal)
+void ActionManager::startMotion()
 {
-    refreshSnapshot();
-
-    if (active_ || takeoff_) {
-        RCLCPP_WARN(get_logger(), "Takeoff rejected: another task is active");
-        return rclcpp_action::GoalResponse::REJECT;
-    }
-
-    if (!std::isfinite(goal.height) || goal.height < 0.0) {
-        RCLCPP_WARN(
-            get_logger(),
-            "Takeoff rejected: height must be finite and >= 0");
-        return rclcpp_action::GoalResponse::REJECT;
-    }
-
-    const auto admission =
-        fsm_->check_action(ActionType::TAKEOFF);
-
-    if (!admission.accepted) {
-        RCLCPP_WARN(
-            get_logger(),
-            "Takeoff rejected: %s",
-            admission.reason.c_str());
-        return rclcpp_action::GoalResponse::REJECT;
-    }
-
-    TakeoffOperation operation;
-    operation.uuid = uuid;
-    operation.height = goal.height == 0.0
-        ? takeoff_default_height_
-        : goal.height;
-    operation.constraints = takeoff_constraints_;
-
-    takeoff_.emplace(std::move(operation));
-
-    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
-}
-
-rclcpp_action::CancelResponse ActionManager::handleTakeoffCancel(
-    const GoalUUID& uuid)
-{
-    if (!takeoff_ || takeoff_->uuid != uuid)
-        return rclcpp_action::CancelResponse::REJECT;
-
-    // 只记录终止意图，由定时器请求真实停止并等待确认。
-    takeoff_->cancel_requested = true;
-
-    return rclcpp_action::CancelResponse::ACCEPT;
-}
-
-void ActionManager::attachTakeoffGoal(
-    const std::shared_ptr<
-        rclcpp_action::ServerGoalHandle<Takeoff>>& handle)
-{
-    if (!takeoff_ || takeoff_->uuid != handle->get_goal_id()) {
-        auto result = std::make_shared<Takeoff::Result>();
-        result->success = false;
-        result->error_code =
-            static_cast<std::uint16_t>(ErrorCode::INTERNAL_ERROR);
-        result->message = "Accepted Takeoff has no matching slot";
-
-        handle->abort(result);
-        latchFault(result->message);
+    if (!motion_)
         return;
-    }
 
-    takeoff_->feedback =
-        [handle](const Takeoff::Feedback& feedback)
-        {
-            if (!handle->is_executing())
-                return;
-
-            handle->publish_feedback(
-                std::make_shared<Takeoff::Feedback>(feedback));
-        };
-
-    takeoff_->finish =
-        [handle](
-            ActionState state,
-            ErrorCode error,
-            const std::string& message)
-        {
-            auto result = std::make_shared<Takeoff::Result>();
-            result->success = state == ActionState::SUCCEEDED;
-            result->error_code = static_cast<std::uint16_t>(error);
-            result->message = message;
-
-            if (state == ActionState::SUCCEEDED) {
-                handle->succeed(result);
-            }
-            else if (state == ActionState::CANCELED) {
-                if (!handle->is_canceling())
-                    throw std::logic_error("Takeoff is not CANCELING");
-
-                handle->canceled(result);
-            }
-            else {
-                handle->abort(result);
-            }
-        };
-
-    takeoff_->attached = true;
-}
-
-void ActionManager::startTakeoff()
-{
     refreshSnapshot();
 
     const auto admission =
-        fsm_->check_action(ActionType::TAKEOFF);
+        fsm_->check_action(motion_->type);
 
     if (!admission.accepted) {
-        finishTakeoff(
+        finishMotion(
             ActionState::FAILED,
             ErrorCode::STATE_REJECTED,
             admission.reason);
@@ -932,108 +1212,121 @@ void ActionManager::startTakeoff()
         motion_executor_->get_parameter(
             "execution.state_timeout").as_double();
 
-    const auto fresh = [now, state_timeout](const auto& cache)
-    {
-        return cache.received &&
-               cache.valid &&
-               now >= cache.received_at &&
-               std::chrono::duration<double>(
-                   now - cache.received_at).count() <= state_timeout;
-    };
-
-    if (!fresh(raw.position) ||
-        !fresh(raw.velocity) ||
-        !fresh(raw.attitude) ||
+    if (!freshCache(raw.position, now, state_timeout) ||
+        !freshCache(raw.velocity, now, state_timeout) ||
+        !freshCache(raw.attitude, now, state_timeout) ||
         raw.position.message.header.frame_id != "map" ||
         raw.velocity.message.header.frame_id != "map" ||
         raw.attitude.message.header.frame_id != "map") {
-        finishTakeoff(
+        finishMotion(
             ActionState::FAILED,
             ErrorCode::STATE_REJECTED,
-            "Takeoff start feedback is invalid or stale");
+            "Motion start feedback is invalid or stale");
         return;
     }
 
     const auto& position = raw.position.message.point;
 
-    PlanningRequest request;
-    request.planner_type = PlannerType::FIXED;
-    request.frame_id = "map";
+    PlanningRequest request = motion_->request;
 
-    request.target_position = Eigen::Vector3d(
-        position.x,
-        position.y,
-        position.z + takeoff_->height);
+    if (motion_->type == ActionType::TAKEOFF) {
+        request.planner_type = PlannerType::FIXED;
+        request.frame_id = "map";
 
-    request.target_yaw = measuredYaw(raw.attitude.message);
-    request.yaw_direction = 0;
-    request.controller_id = "position_yaw_pid";
-    request.config_name = "default";
+        request.target_position = Eigen::Vector3d(
+            position.x,
+            position.y,
+            position.z + motion_->height);
+
+        request.target_yaw =
+            measuredYaw(raw.attitude.message);
+
+        request.yaw_direction = 0;
+        request.controller_id = "position_yaw_pid";
+        request.config_name = "default";
+    }
 
     const auto planning = planner_.plan(request);
 
     if (!planning.success()) {
-        finishTakeoff(
+        finishMotion(
             ActionState::FAILED,
             ErrorCode::STATE_REJECTED,
-            "Takeoff planning failed: " + planning.reason);
+            "Motion planning failed: " + planning.reason);
         return;
     }
 
-    takeoff_->start_z = position.z;
-    takeoff_->motion = planning.motion;
+    const double initial_distance = std::hypot(
+        request.target_position.x() - position.x,
+        request.target_position.y() - position.y,
+        request.target_position.z() - position.z);
 
-    // 必须先进入 TAKING_OFF，再发布轨迹，
-    // 防止真实离地被 FSM 当成 GROUNDED 下的意外离地。
+    if (!std::isfinite(initial_distance)) {
+        finishMotion(
+            ActionState::FAILED,
+            ErrorCode::STATE_REJECTED,
+            "Motion target distance is not finite");
+        return;
+    }
+
+    motion_->start_z = position.z;
+    motion_->initial_distance = initial_distance;
+    motion_->motion = planning.motion;
+
+    const auto started_event =
+        motion_->type == ActionType::TAKEOFF
+            ? FlightEvent::TAKEOFF_STARTED
+            : FlightEvent::GOTO_STARTED;
+
+    // 先建立任务飞行阶段，再向 Ctrl 发布轨迹。
     const auto transition =
-        fsm_->process_event(FlightEvent::TAKEOFF_STARTED);
+        fsm_->process_event(started_event);
 
     if (!transition.accepted) {
-        finishTakeoff(
+        finishMotion(
             ActionState::FAILED,
             ErrorCode::STATE_REJECTED,
             transition.reason);
         return;
     }
 
-    takeoff_->fsm_started = true;
+    motion_->fsm_started = true;
 
     std::string rejection;
 
     const auto id = motion_executor_->startExecution(
-        takeoff_->motion,
-        takeoff_->constraints,
+        motion_->motion,
+        motion_->constraints,
         rejection);
 
     if (!id) {
-        // FSM 已经开始任务；执行却未建立，不能留在 TAKING_OFF。
-        latchFault("Takeoff dispatch failed: " + rejection);
+        latchFault("Motion dispatch failed: " + rejection);
 
-        finishTakeoff(
+        finishMotion(
             ActionState::FAILED,
             ErrorCode::STATE_REJECTED,
             rejection);
         return;
     }
 
-    takeoff_->trajectory_id = *id;
-    takeoff_->dispatched_at = Clock::now();
+    motion_->trajectory_id = *id;
+    motion_->dispatched_at = Clock::now();
 
     RCLCPP_INFO(
         get_logger(),
-        "Takeoff dispatched: id=%llu relative_height=%.3f "
+        "%s dispatched: id=%llu "
         "target=(%.3f, %.3f, %.3f) yaw=%.3f",
+        motion_->type == ActionType::TAKEOFF ? "Takeoff" : "GoTo",
         static_cast<unsigned long long>(*id),
-        takeoff_->height,
         request.target_position.x(),
         request.target_position.y(),
         request.target_position.z(),
         request.target_yaw);
 }
 
-bool ActionManager::takeoffAtTarget() const
+bool ActionManager::motionAtTarget() const
 {
-    if (!takeoff_)
+    if (!motion_)
         return false;
 
     const auto observation = fsm_->snapshot();
@@ -1056,24 +1349,18 @@ bool ActionManager::takeoffAtTarget() const
         motion_executor_->get_parameter(
             "execution.state_timeout").as_double();
 
-    const auto fresh = [now, state_timeout](const auto& cache)
-    {
-        return cache.received &&
-               cache.valid &&
-               now >= cache.received_at &&
-               std::chrono::duration<double>(
-                   now - cache.received_at).count() <= state_timeout;
-    };
-
-    if (!fresh(raw.position) ||
-        !fresh(raw.velocity) ||
-        !fresh(raw.attitude)) {
+    if (!freshCache(raw.position, now, state_timeout) ||
+        !freshCache(raw.velocity, now, state_timeout) ||
+        !freshCache(raw.attitude, now, state_timeout) ||
+        raw.position.message.header.frame_id != "map" ||
+        raw.velocity.message.header.frame_id != "map" ||
+        raw.attitude.message.header.frame_id != "map") {
         return false;
     }
 
     const auto& position = raw.position.message.point;
     const auto& velocity = raw.velocity.message.vector;
-    const auto& target = takeoff_->motion.target_position;
+    const auto& target = motion_->motion.target_position;
 
     const double position_error = std::hypot(
         position.x - target.x(),
@@ -1085,96 +1372,41 @@ bool ActionManager::takeoffAtTarget() const
 
     const double yaw_delta =
         measuredYaw(raw.attitude.message) -
-        takeoff_->motion.target_yaw;
+        motion_->motion.target_yaw;
 
     const double yaw_error = std::abs(std::atan2(
-        std::sin(yaw_delta), std::cos(yaw_delta)));
+        std::sin(yaw_delta),
+        std::cos(yaw_delta)));
 
     return
-        position_error <= takeoff_->constraints.position_tolerance &&
-        speed <= takeoff_->constraints.velocity_tolerance &&
-        yaw_error <= takeoff_->constraints.yaw_tolerance;
+        position_error <=
+            motion_->constraints.position_tolerance &&
+        speed <=
+            motion_->constraints.velocity_tolerance &&
+        yaw_error <=
+            motion_->constraints.yaw_tolerance;
 }
 
-void ActionManager::publishTakeoffFeedback()
+void ActionManager::tickMotion()
 {
-    if (!takeoff_ || !takeoff_->trajectory_id)
+    if (!motion_ || !motion_->attached)
         return;
 
-    const auto now = Clock::now();
-
-    if (now < takeoff_->next_feedback_at)
-        return;
-
-    takeoff_->next_feedback_at =
-        now + std::chrono::duration_cast<Clock::duration>(
-            std::chrono::duration<double>(feedback_period_));
-
-    const auto raw = motion_executor_->getStateSnapshot();
-
-    const double state_timeout =
-        motion_executor_->get_parameter(
-            "execution.state_timeout").as_double();
-
-    if (!raw.position.received ||
-        !raw.position.valid ||
-        now < raw.position.received_at ||
-        std::chrono::duration<double>(
-            now - raw.position.received_at).count() > state_timeout) {
-        return;
-    }
-
-    Takeoff::Feedback feedback;
-
-    feedback.current_height =
-        raw.position.message.point.z - takeoff_->start_z;
-
-    feedback.progress = static_cast<float>(std::clamp(
-        feedback.current_height / takeoff_->height, 0.0, 1.0));
-
-    if (takeoff_->terminal_event) {
-        feedback.phase = "WAITING_FSM_CONFIRMATION";
-    }
-    else {
-        switch (motion_executor_->getExecutionSnapshot().phase) {
-        case MotionExecutor::ExecutionPhase::WAITING_TRACKING:
-            feedback.phase = "WAITING_TRACKING";
-            break;
-        case MotionExecutor::ExecutionPhase::TRACKING:
-            feedback.phase = "TRACKING";
-            break;
-        case MotionExecutor::ExecutionPhase::WAITING_HOVER:
-            feedback.phase = "WAITING_HOVER";
-            break;
-        case MotionExecutor::ExecutionPhase::IDLE:
-            feedback.phase = "WAITING_EXECUTION_EVENT";
-            break;
-        }
-    }
-
-    takeoff_->feedback(feedback);
-}
-
-void ActionManager::tickTakeoff()
-{
-    if (!takeoff_ || !takeoff_->attached)
-        return;
-
-    if (!takeoff_->trajectory_id) {
-        if (!takeoff_->failure.empty()) {
-            finishTakeoff(
+    if (!motion_->trajectory_id) {
+        if (!motion_->failure.empty()) {
+            finishMotion(
                 ActionState::FAILED,
                 ErrorCode::VEHICLE_FAULT,
-                takeoff_->failure);
+                motion_->failure);
         }
-        else if (takeoff_->cancel_requested) {
-            finishTakeoff(
+        else if (motion_->cancel_requested) {
+            finishMotion(
                 ActionState::CANCELED,
                 ErrorCode::CANCELED,
-                "Takeoff canceled before trajectory dispatch");
+                "Motion canceled before trajectory dispatch");
         }
         else {
-            startTakeoff();
+            startMotion();
         }
 
         return;
@@ -1182,28 +1414,29 @@ void ActionManager::tickTakeoff()
 
     const auto now = Clock::now();
 
-    if (takeoff_->terminal_event) {
-        const auto event = *takeoff_->terminal_event;
+    if (motion_->terminal_event) {
+        const auto event = *motion_->terminal_event;
 
         if (event.outcome ==
                 MotionExecutor::ExecutionOutcome::FAILED ||
             !event.safe_stop_confirmed) {
             latchFault(event.message);
 
-            finishTakeoff(
+            finishMotion(
                 ActionState::FAILED,
                 ErrorCode::MOTION_FAILED,
                 event.message);
             return;
         }
 
-        if (!takeoff_->failure.empty()) {
-            latchFault(takeoff_->failure);
+        // 已发生故障时，安全停止成功也不能改报正常完成。
+        if (!motion_->failure.empty()) {
+            latchFault(motion_->failure);
 
-            finishTakeoff(
+            finishMotion(
                 ActionState::FAILED,
                 ErrorCode::VEHICLE_FAULT,
-                takeoff_->failure);
+                motion_->failure);
             return;
         }
 
@@ -1220,39 +1453,40 @@ void ActionManager::tickTakeoff()
                 MotionExecutor::StopReason::CLIENT_CANCEL;
 
         if (!completed &&
-            !(takeoff_->cancel_requested && canceled)) {
-            latchFault("Unexpected Takeoff execution outcome");
+            !(motion_->cancel_requested && canceled)) {
+            latchFault("Unexpected motion execution outcome");
 
-            finishTakeoff(
+            finishMotion(
                 ActionState::FAILED,
                 ErrorCode::MOTION_FAILED,
-                "Unexpected Takeoff execution outcome");
+                "Unexpected motion execution outcome");
             return;
         }
 
-        if (takeoff_->cancel_requested &&
-            !takeoff_->stop_requested) {
-            // Cancel 可能与正常完成事件交叉到达。
-            // 已有安全停止证明时不重复发送 CANCEL。
+        if (motion_->cancel_requested &&
+            !motion_->stop_requested) {
+            // Cancel 与正常完成事件可能交叉到达。
+            // 已有安全停止证明时，不重复发送 Ctrl CANCEL。
             const auto transition =
                 fsm_->process_event(FlightEvent::STOP_STARTED);
 
             if (!transition.accepted) {
                 latchFault(transition.reason);
-                finishTakeoff(
+
+                finishMotion(
                     ActionState::FAILED,
                     ErrorCode::STATE_REJECTED,
                     transition.reason);
                 return;
             }
 
-            takeoff_->stop_requested = true;
+            motion_->stop_requested = true;
         }
 
         refreshSnapshot();
 
         if (fsm_->phase() == FlightPhase::FAULT) {
-            finishTakeoff(
+            finishMotion(
                 ActionState::FAILED,
                 ErrorCode::VEHICLE_FAULT,
                 fsm_->fault_reason());
@@ -1261,7 +1495,7 @@ void ActionManager::tickTakeoff()
 
         const auto observation = fsm_->snapshot();
 
-        if (takeoff_->cancel_requested) {
+        if (motion_->cancel_requested) {
             std::optional<FlightEvent> confirmation;
 
             if (observation.connected_valid &&
@@ -1273,8 +1507,9 @@ void ActionManager::tickTakeoff()
                 confirmation =
                     FlightEvent::STOP_GROUNDED_CONFIRMED;
             }
-            else if (observation.hover_confirmed &&
-                     !observation.execution_active) {
+            else if (
+                observation.hover_confirmed &&
+                !observation.execution_active) {
                 confirmation =
                     FlightEvent::STOP_HOVER_CONFIRMED;
             }
@@ -1284,125 +1519,108 @@ void ActionManager::tickTakeoff()
                     fsm_->process_event(*confirmation);
 
                 if (transition.accepted) {
-                    finishTakeoff(
+                    finishMotion(
                         ActionState::CANCELED,
                         ErrorCode::CANCELED,
-                        "Takeoff canceled after confirmed safe stop");
+                        "Motion canceled after confirmed safe stop");
                     return;
                 }
             }
         }
-        else if (takeoffAtTarget()) {
+        else if (motionAtTarget()) {
+            const auto completed_event =
+                motion_->type == ActionType::TAKEOFF
+                    ? FlightEvent::TAKEOFF_COMPLETED
+                    : FlightEvent::GOTO_COMPLETED;
+
             const auto transition =
-                fsm_->process_event(FlightEvent::TAKEOFF_COMPLETED);
+                fsm_->process_event(completed_event);
 
             if (transition.accepted) {
-                finishTakeoff(
+                finishMotion(
                     ActionState::SUCCEEDED,
                     ErrorCode::NONE,
-                    "Takeoff target reached; stable HOVER confirmed");
+                    "Motion target reached; stable HOVER confirmed");
                 return;
             }
         }
 
-        // 执行完成事件与独立悬停观测可能相差几个周期。
-        // 不在第一个周期条件尚未齐全时立即误报失败。
+        // 执行完成事件与独立稳定悬停观测可能相差几个周期。
         if (std::chrono::duration<double>(
-                now - takeoff_->event_received_at).count() >=
-            takeoff_confirmation_timeout_) {
-            latchFault("Takeoff FSM confirmation timeout");
+                now - motion_->event_received_at).count() >=
+            motion_->confirmation_timeout) {
+            latchFault("Motion FSM confirmation timeout");
 
-            finishTakeoff(
+            finishMotion(
                 ActionState::FAILED,
                 ErrorCode::TIMEOUT,
-                "Takeoff FSM confirmation timeout");
+                "Motion FSM confirmation timeout");
             return;
         }
 
-        publishTakeoffFeedback();
+        publishMotionFeedback();
         return;
     }
 
-    if ((takeoff_->cancel_requested ||
-         !takeoff_->failure.empty()) &&
-        !takeoff_->stop_requested) {
-        // 故障状态不会被 STOP_STARTED 清除。
-        if (fsm_->phase() != FlightPhase::FAULT)
-            fsm_->process_event(FlightEvent::STOP_STARTED);
+    if ((motion_->cancel_requested ||
+         !motion_->failure.empty()) &&
+        !motion_->stop_requested) {
+        // FAULT 不会被停止请求解除。
+        if (fsm_->phase() != FlightPhase::FAULT) {
+            const auto transition =
+                fsm_->process_event(FlightEvent::STOP_STARTED);
 
-        const bool accepted = motion_executor_->requestStop(
-            *takeoff_->trajectory_id,
-            MotionExecutor::StopReason::CLIENT_CANCEL);
+            if (!transition.accepted) {
+                motion_->failure =
+                    "Stop transition rejected: " + transition.reason;
+                latchFault(motion_->failure);
+            }
+        }
 
-        takeoff_->stop_requested = true;
+        const bool accepted =
+            motion_executor_->requestStop(
+                *motion_->trajectory_id,
+                MotionExecutor::StopReason::CLIENT_CANCEL);
+
+        motion_->stop_requested = true;
 
         if (!accepted) {
-            // 可能刚完成、事件还在跨节点队列中。
-            // 先等待匹配事件，不把 false 当成停止成功。
+            // 可能执行已结束，而事件尚在跨节点队列中。
+            // false 不代表停止成功，继续等待匹配终态事件。
             RCLCPP_WARN(
                 get_logger(),
-                "Takeoff stop request not attached to active execution; "
+                "Motion stop request not attached to active execution; "
                 "waiting for the matching terminal event");
         }
     }
 
-    // 执行器负责主要超时；此处防止终态事件丢失后永久占槽。
+    // 执行器负责主要超时；这里防止终态事件丢失后永久占槽。
     const double stop_timeout =
         motion_executor_->get_parameter(
             "execution.stop_timeout").as_double();
 
     const double result_timeout =
-        takeoff_->constraints.timeout +
+        motion_->constraints.timeout +
         stop_timeout +
-        takeoff_confirmation_timeout_;
+        motion_->confirmation_timeout;
 
     if (std::chrono::duration<double>(
-            now - takeoff_->dispatched_at).count() >= result_timeout) {
+            now - motion_->dispatched_at).count() >=
+        result_timeout) {
         motion_executor_->requestStop(
-            *takeoff_->trajectory_id,
+            *motion_->trajectory_id,
             MotionExecutor::StopReason::CLIENT_CANCEL);
 
-        latchFault("Takeoff terminal event timeout");
+        latchFault("Motion terminal event timeout");
 
-        finishTakeoff(
+        finishMotion(
             ActionState::FAILED,
             ErrorCode::TIMEOUT,
-            "Takeoff terminal event timeout; safe stop not confirmed");
+            "Motion terminal event timeout; safe stop not confirmed");
         return;
     }
 
-    publishTakeoffFeedback();
-}
-
-void ActionManager::finishTakeoff(
-    ActionState state,
-    ErrorCode error,
-    const std::string& message)
-{
-    if (!takeoff_ || !takeoff_->attached)
-        return;
-
-    // message 可能引用任务中的 failure，必须先复制再释放任务。
-    const std::string text = message;
-    auto finish = std::move(takeoff_->finish);
-
-    takeoff_.reset();
-
-    try {
-        finish(state, error, text);
-    }
-    catch (const std::exception& exception) {
-        latchFault(
-            std::string("Takeoff terminal delivery failed: ") +
-            exception.what());
-    }
-
-    RCLCPP_INFO(
-        get_logger(),
-        "Takeoff terminal state=%d error=%u: %s",
-        static_cast<int>(state),
-        static_cast<unsigned>(error),
-        text.c_str());
+    publishMotionFeedback();
 }
 
 }  // namespace drone_node::exec

@@ -728,7 +728,7 @@ void MotionExecutor::updateExecution()
             context.phase == ExecutionPhase::WAITING_HOVER &&
             context.stop_reason == StopReason::COMPLETED &&
             state.landed.message.data) {
-            fail_now("Unexpected ground contact during Takeoff completion");
+            fail_now("Unexpected ground contact during motion completion");
         }
         else {
             const bool later_status = statusAfter(state, context);

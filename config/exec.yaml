@@ -48,3 +48,10 @@ action_manager:
       settle_duration: 0.5
       timeout: 15.0
       confirmation_timeout: 2.0
+    goto:
+      position_tolerance: 0.15
+      yaw_tolerance: 0.10
+      velocity_tolerance: 0.15
+      settle_duration: 0.5
+      timeout: 30.0
+      confirmation_timeout: 2.0

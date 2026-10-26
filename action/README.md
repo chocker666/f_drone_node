@@ -517,3 +517,47 @@ Result.error_code 新增：
 - 8：运动执行失败。
 
 本阶段不自动解锁，不自动切换 PX4 Offboard。
+
+## Exec 正式版重构：阶段 7 GoTo
+
+当前支持 Arm、Disarm、Takeoff、GoTo。
+Land、Stop 的 Goal 继续明确拒绝。
+
+### GoTo Goal
+
+- header.frame_id 必须严格为 map。
+- position 是 map/ENU 绝对位置，单位 m。
+- yaw 是 ENU 目标航向，单位 rad。
+- 位置和 yaw 必须为有限数值。
+- header.stamp 不作为预约执行时间。
+
+### 准入及执行
+
+仅从已确认的 HOVERING 接纳。
+同一时间只允许一个活动任务，普通新 Goal 不抢占旧任务。
+
+MotionPlanner/FixedPlanner 生成 POINT，
+使用 position_yaw_pid、default 配置和最短 Yaw 旋转方向。
+
+必须经历匹配轨迹 ID 的 TRACKING、真实位置/Yaw/速度稳定、
+自动 CANCEL、新鲜 HOVER 和 FSM GOTO_COMPLETED，
+Action 才能 SUCCEEDED。
+
+### Feedback
+
+- remaining_distance：当前真实位置到固定目标的三维距离。
+- progress：相对于初始三维距离的位置进度，限制在 [0, 1]。
+- phase：当前执行或确认阶段。
+
+相同位置、不同 Yaw 的任务仍需姿态和稳定确认。
+progress=1 不代表 Action 已完成。
+
+### Cancel 与异常
+
+发布前取消直接 CANCELED。
+发布后取消必须等待安全停止及 FSM 确认，再 CANCELED。
+不保留恢复上下文。
+
+故障和无法确认安全停止优先报告 ABORTED。
+仅处理匹配当前任务轨迹 ID 的执行事件。
+暂停、Continue 和 Stop 留待阶段 8。

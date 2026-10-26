@@ -36,8 +36,8 @@ public:
 
     ~ActionManager() override;
 
-    // MotionExecutor 可能从另一个节点的回调线程调用。
-    // 这里只入队，不直接操作 GoalHandle 或活动任务。
+    // 跨节点回调只负责入队。
+    // GoalHandle 和活动任务由本节点的互斥回调组处理。
     void enqueueExecutionEvent(
         const MotionExecutor::ExecutionEvent& event);
 
@@ -89,7 +89,9 @@ private:
 
         std::optional<MotionExecutor::ArmRequest> request;
 
-        std::function<void(std::uint8_t, const std::string&)> feedback;
+        std::function<void(
+            std::uint8_t stage,
+            const std::string& message)> feedback;
 
         std::function<void(
             ActionState,
@@ -97,19 +99,27 @@ private:
             const std::string&)> finish;
     };
 
-    struct TakeoffOperation
+    struct MotionOperation
     {
         GoalUUID uuid{};
+        ActionType type{ActionType::TAKEOFF};
+
         bool attached{false};
         bool cancel_requested{false};
         bool stop_requested{false};
         bool fsm_started{false};
 
+        // Takeoff 的相对高度目标及起始高度。
         double height{0.0};
         double start_z{0.0};
 
+        // GoTo 保存固定目标，初始距离用于计算真实位置进度。
+        PlanningRequest request;
+        double initial_distance{0.0};
+
         PlannedMotion motion;
         MotionExecutor::ExecutionConstraints constraints;
+        double confirmation_timeout{2.0};
 
         std::optional<std::uint64_t> trajectory_id;
         std::optional<MotionExecutor::ExecutionEvent> terminal_event;
@@ -121,7 +131,11 @@ private:
         // 非空时优先以失败结束，即使后续停止成功。
         std::string failure;
 
-        std::function<void(const Takeoff::Feedback&)> feedback;
+        // value：Takeoff 为相对高度，GoTo 为剩余距离。
+        std::function<void(
+            const std::string& phase,
+            float progress,
+            double value)> feedback;
 
         std::function<void(
             ActionState,
@@ -145,37 +159,36 @@ private:
         const std::shared_ptr<
             rclcpp_action::ServerGoalHandle<ActionT>>& handle);
 
-                rclcpp_action::GoalResponse handleTakeoffGoal(
+    rclcpp_action::GoalResponse handleTakeoffGoal(
         const GoalUUID& uuid,
         const Takeoff::Goal& goal);
 
-    rclcpp_action::CancelResponse handleTakeoffCancel(
+    rclcpp_action::GoalResponse handleGoToGoal(
+        const GoalUUID& uuid,
+        const GoTo::Goal& goal);
+
+    rclcpp_action::CancelResponse handleMotionCancel(
         const GoalUUID& uuid);
 
-    void attachTakeoffGoal(
+    template<typename ActionT>
+    void attachMotionGoal(
         const std::shared_ptr<
-            rclcpp_action::ServerGoalHandle<Takeoff>>& handle);
-
-    void startTakeoff();
-    void tickTakeoff();
-    void publishTakeoffFeedback();
-    bool takeoffAtTarget() const;
-
-    void finishTakeoff(
-        ActionState state,
-        ErrorCode error,
-        const std::string& message);
-
-    static double measuredYaw(
-        const geometry_msgs::msg::QuaternionStamped& attitude);
+            rclcpp_action::ServerGoalHandle<ActionT>>& handle);
 
     void tick();
     void tickArm();
+
+    void startMotion();
+    void tickMotion();
 
     void refreshSnapshot();
     void processExecutionEvents();
 
     void publishFeedback();
+    void publishMotionFeedback();
+
+    bool motionAtTarget() const;
+
     void clearPendingRequest();
 
     void finishActive(
@@ -183,10 +196,20 @@ private:
         ErrorCode error,
         const std::string& message);
 
+    void finishMotion(
+        ActionState state,
+        ErrorCode error,
+        const std::string& message);
+
     void latchFault(const std::string& reason);
+
+    static double measuredYaw(
+        const geometry_msgs::msg::QuaternionStamped& attitude);
 
     std::shared_ptr<MotionExecutor> motion_executor_;
     std::shared_ptr<FlightStateMachine> fsm_;
+
+    MotionPlanner planner_;
 
     rclcpp_action::Server<Arm>::SharedPtr arm_server_;
     rclcpp_action::Server<Disarm>::SharedPtr disarm_server_;
@@ -197,27 +220,29 @@ private:
 
     rclcpp::TimerBase::SharedPtr timer_;
 
-    // 所有 Action 回调和管理定时器都使用本节点默认互斥回调组。
-    // 因而 active_ 不会被这些回调并发访问。
+    // Action 回调和管理定时器使用本节点默认互斥回调组。
+    // 所有接纳入口共同检查这两个任务槽，保证单活动任务。
     std::optional<ArmOperation> active_;
+    std::optional<MotionOperation> motion_;
+
     FlightPhase logged_phase_{FlightPhase::UNKNOWN};
 
-    // 跨节点执行事件单独通过互斥队列传递。
+    // MotionExecutor 的跨节点事件通过此队列传递。
     std::mutex event_mutex_;
     std::deque<MotionExecutor::ExecutionEvent> execution_events_;
-
-    MotionPlanner planner_;
-    std::optional<TakeoffOperation> takeoff_;
-
-    double takeoff_default_height_{1.5};
-    double takeoff_confirmation_timeout_{2.0};
-    MotionExecutor::ExecutionConstraints takeoff_constraints_;
 
     double service_wait_timeout_{3.0};
     double response_timeout_{6.0};
     double observation_timeout_{2.5};
     double action_timeout_{15.0};
     double feedback_period_{0.2};
+
+    double takeoff_default_height_{1.5};
+    double takeoff_confirmation_timeout_{2.0};
+    MotionExecutor::ExecutionConstraints takeoff_constraints_;
+
+    double goto_confirmation_timeout_{2.0};
+    MotionExecutor::ExecutionConstraints goto_constraints_;
 };
 
 }  // namespace drone_node::exec

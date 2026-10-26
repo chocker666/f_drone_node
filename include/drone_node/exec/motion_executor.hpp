@@ -88,8 +88,7 @@ public:
         double velocity_tolerance{0.15};  // m/s
         double settle_duration{0.5};      // s
         double timeout{30.0};             // s
-        // Takeoff must confirm actual airborne state before success.
-        // Other tasks leave this disabled.
+        // Takeoff/GoTo 正常完成时要求真实空中状态。
         bool require_airborne{false};
     };
 
