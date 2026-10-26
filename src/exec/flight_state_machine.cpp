@@ -120,10 +120,26 @@ void FlightStateMachine::update_snapshot(
         break;
 
     case FlightPhase::TAKING_OFF:
-    case FlightPhase::LANDING:
-        // 起飞和降落过程中允许 landed 变化。
         if (!flight_feedback_valid_locked())
-            fault("Flight feedback or control lost");
+            fault("Flight feedback or control lost during Takeoff");
+        break;
+
+    case FlightPhase::LANDING:
+        if (grounded_confirmed_locked()) {
+            // PX4 可能在接地后自行上锁。
+            // 接地已确认时，不能再要求 armed=true。
+            if (!snapshot_.position_valid ||
+                !snapshot_.velocity_valid ||
+                !snapshot_.attitude_valid ||
+                !snapshot_.control_status_valid ||
+                !snapshot_.control_available ||
+                snapshot_.control_fault) {
+                fault("Grounded landing feedback or control lost");
+            }
+        }
+        else if (!flight_feedback_valid_locked()) {
+            fault("Airborne landing feedback or control lost");
+        }
         break;
 
     case FlightPhase::STOPPING:

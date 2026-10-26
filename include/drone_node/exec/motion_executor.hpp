@@ -90,6 +90,8 @@ public:
         double timeout{30.0};             // s
         // Takeoff/GoTo 正常完成时要求真实空中状态。
         bool require_airborne{false};
+        // Land 使用接地真值完成，不要求到达地下参考点。
+        bool complete_on_landed{false};
     };
 
 
@@ -206,7 +208,8 @@ private:
 
     std::string stateProblem(
         const StateSnapshot& state,
-        Clock::time_point time) const;
+        Clock::time_point time,
+        bool allow_ground_disarmed = false) const;
 
     bool statusAfter(
         const StateSnapshot& state,

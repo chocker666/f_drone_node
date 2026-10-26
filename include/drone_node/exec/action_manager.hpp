@@ -125,6 +125,10 @@ private:
         bool is_continue{false};
         bool resumed_target{false};
 
+        // Land 已完成落地确认，正在执行内部 Disarm 步骤。
+        // 此时不再存在活动运动轨迹。
+        bool landing_disarm{false};
+
         double height{0.0};
         double start_z{0.0};
 
@@ -160,6 +164,7 @@ private:
 
         // value 的含义：
         // Takeoff：相对高度。
+        // Land：当前 map 坐标系 z。
         // GoTo/Continue：剩余距离。
         // Hover：已完成保持时间。
         std::function<void(
@@ -239,6 +244,10 @@ private:
         const GoalUUID& uuid,
         const GoTo::Goal& goal);
 
+    rclcpp_action::GoalResponse handleLandGoal(
+        const GoalUUID& uuid,
+        const Land::Goal& goal);
+
     rclcpp_action::GoalResponse handleStopGoal(
         const GoalUUID& uuid);
 
@@ -289,7 +298,12 @@ private:
     // 规划及执行确认。
     void startMotion();
     bool motionAtTarget() const;
+    bool landingConfirmed() const;
     bool stopObservationConfirmed() const;
+
+    // 落地确认后，复用异步 Arm 服务流程执行 Disarm。
+    // 该步骤属于原 Land/Continue Goal，不创建新的 Action Goal。
+    void beginLandDisarm();
 
     // 真实反馈和任务级进度。
     void publishFeedback();
@@ -322,6 +336,9 @@ private:
     static double measuredYaw(
         const geometry_msgs::msg::QuaternionStamped& attitude);
 
+    // map 坐标系绝对高度，非相对当前位置下降 1 米。
+    static constexpr double LAND_TARGET_Z = -1.0;
+
     std::shared_ptr<MotionExecutor> motion_executor_;
     std::shared_ptr<FlightStateMachine> fsm_;
 
@@ -339,7 +356,9 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
 
     // Action 回调和管理定时器使用默认互斥回调组。
-    // active_ 与 motion_ 不同时占用。
+    // 普通 Arm/Disarm 与运动任务互斥。
+    // 仅 Land 落地后的内部 Disarm 步骤允许 active_ 与 motion_ 同时存在；
+    // 二者属于同一个 Goal，并由 motion_->landing_disarm 标识。
     std::optional<ArmOperation> active_;
     std::optional<MotionOperation> motion_;
 
@@ -367,6 +386,10 @@ private:
 
     double goto_confirmation_timeout_{2.0};
     MotionExecutor::ExecutionConstraints goto_constraints_;
+
+    double land_confirmation_timeout_{2.0};
+    MotionExecutor::ExecutionConstraints land_constraints_;
+    bool land_auto_disarm_{false};
 
     double stop_timeout_{8.0};
     double stop_settle_duration_{0.5};

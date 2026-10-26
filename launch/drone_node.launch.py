@@ -7,6 +7,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     config = Path(get_package_share_directory("drone_node")) / "config"
+
     return LaunchDescription([
         Node(
             package="drone_node",
@@ -15,6 +16,14 @@ def generate_launch_description():
             parameters=[
                 str(config / "inter.yaml"),
                 str(config / "ctrl.yaml"),
+            ],
+        ),
+        Node(
+            package="drone_node",
+            executable="motion_executor_exec",
+            output="screen",
+            parameters=[
+                str(config / "exec.yaml"),
             ],
         ),
     ])

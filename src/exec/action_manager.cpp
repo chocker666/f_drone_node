@@ -80,43 +80,54 @@ ActionManager::ActionManager(
 
     takeoff_constraints_.position_tolerance = positive_parameter(
         "takeoff.position_tolerance", 0.15);
-
     takeoff_constraints_.yaw_tolerance = positive_parameter(
         "takeoff.yaw_tolerance", 0.10);
-
     takeoff_constraints_.velocity_tolerance = positive_parameter(
         "takeoff.velocity_tolerance", 0.15);
-
     takeoff_constraints_.settle_duration = positive_parameter(
         "takeoff.settle_duration", 0.5);
-
     takeoff_constraints_.timeout = positive_parameter(
         "takeoff.timeout", 15.0);
-
     takeoff_confirmation_timeout_ = positive_parameter(
         "takeoff.confirmation_timeout", 2.0);
 
     takeoff_constraints_.require_airborne = true;
+    takeoff_constraints_.complete_on_landed = false;
 
     goto_constraints_.position_tolerance = positive_parameter(
         "goto.position_tolerance", 0.15);
-
     goto_constraints_.yaw_tolerance = positive_parameter(
         "goto.yaw_tolerance", 0.10);
-
     goto_constraints_.velocity_tolerance = positive_parameter(
         "goto.velocity_tolerance", 0.15);
-
     goto_constraints_.settle_duration = positive_parameter(
         "goto.settle_duration", 0.5);
-
     goto_constraints_.timeout = positive_parameter(
         "goto.timeout", 30.0);
-
     goto_confirmation_timeout_ = positive_parameter(
         "goto.confirmation_timeout", 2.0);
 
     goto_constraints_.require_airborne = true;
+    goto_constraints_.complete_on_landed = false;
+
+    land_constraints_.position_tolerance = positive_parameter(
+        "land.position_tolerance", 0.15);
+    land_constraints_.yaw_tolerance = positive_parameter(
+        "land.yaw_tolerance", 0.10);
+    land_constraints_.velocity_tolerance = positive_parameter(
+        "land.velocity_tolerance", 0.15);
+    land_constraints_.settle_duration = positive_parameter(
+        "land.settle_duration", 0.8);
+    land_constraints_.timeout = positive_parameter(
+        "land.timeout", 30.0);
+    land_confirmation_timeout_ = positive_parameter(
+        "land.confirmation_timeout", 2.0);
+
+    land_auto_disarm_ = declare_parameter<bool>(
+        "land.auto_disarm", false);
+
+    land_constraints_.require_airborne = false;
+    land_constraints_.complete_on_landed = true;
 
     const double executor_stop_timeout =
         motion_executor_->get_parameter(
@@ -145,10 +156,10 @@ ActionManager::ActionManager(
 
     validate_constraints(takeoff_constraints_, "Takeoff");
     validate_constraints(goto_constraints_, "GoTo");
+    validate_constraints(land_constraints_, "Land");
 
     stop_timeout_ = positive_parameter(
         "stop.timeout", 8.0);
-
     stop_settle_duration_ = positive_parameter(
         "stop.settle_duration", 0.5);
 
@@ -161,7 +172,6 @@ ActionManager::ActionManager(
 
     const double check_frequency = positive_parameter(
         "check_frequency", 20.0);
-
     const double feedback_frequency = positive_parameter(
         "feedback_frequency", 5.0);
 
@@ -169,13 +179,10 @@ ActionManager::ActionManager(
 
     service_wait_timeout_ = positive_parameter(
         "arm.service_wait_timeout", 3.0);
-
     response_timeout_ = positive_parameter(
         "arm.response_timeout", 6.0);
-
     observation_timeout_ = positive_parameter(
         "arm.observation_timeout", 2.5);
-
     action_timeout_ = positive_parameter(
         "arm.action_timeout", 15.0);
 
@@ -204,21 +211,17 @@ ActionManager::ActionManager(
     goto_server_ = createServer<GoTo>("/drone_node/goto");
     land_server_ = createServer<Land>("/drone_node/land");
     stop_server_ = createServer<Stop>("/drone_node/stop");
+    continue_server_ = createServer<Continue>("/drone_node/continue");
+    hover_server_ = createServer<Hover>("/drone_node/hover");
 
-    continue_server_ =
-        createServer<Continue>("/drone_node/continue");
-
-    hover_server_ =
-        createServer<Hover>("/drone_node/hover");
-
-    timer_ = create_wall_timer(
-        period, [this] { tick(); });
+    timer_ = create_wall_timer(period, [this] { tick(); });
 
     RCLCPP_INFO(
         get_logger(),
         "ActionManager initialized: "
-        "Arm/Disarm/Takeoff/GoTo/Stop/Continue/Hover enabled; "
-        "Land goals are rejected");
+        "Arm/Disarm/Takeoff/GoTo/Land/Stop/Continue/Hover enabled; "
+        "Land auto_disarm=%s",
+        land_auto_disarm_ ? "true" : "false");
 }
 
 ActionManager::~ActionManager()
@@ -262,6 +265,10 @@ ActionManager::createServer(const std::string& name)
                     return handleGoToGoal(uuid, *goal);
                 }
                 else if constexpr (
+                    std::is_same_v<ActionT, Land>) {
+                    return handleLandGoal(uuid, *goal);
+                }
+                else if constexpr (
                     std::is_same_v<ActionT, Stop>) {
                     return handleStopGoal(uuid);
                 }
@@ -274,11 +281,6 @@ ActionManager::createServer(const std::string& name)
                     return handleHoverGoal(uuid, *goal);
                 }
                 else {
-                    RCLCPP_WARN(
-                        get_logger(),
-                        "%s rejected: not implemented in this stage",
-                        name.c_str());
-
                     return rclcpp_action::GoalResponse::REJECT;
                 }
             }
@@ -311,6 +313,7 @@ ActionManager::createServer(const std::string& name)
             else if constexpr (
                 std::is_same_v<ActionT, Takeoff> ||
                 std::is_same_v<ActionT, GoTo> ||
+                std::is_same_v<ActionT, Land> ||
                 std::is_same_v<ActionT, Continue> ||
                 std::is_same_v<ActionT, Hover>) {
                 return handleMotionCancel(handle->get_goal_id());
@@ -335,6 +338,7 @@ ActionManager::createServer(const std::string& name)
             else if constexpr (
                 std::is_same_v<ActionT, Takeoff> ||
                 std::is_same_v<ActionT, GoTo> ||
+                std::is_same_v<ActionT, Land> ||
                 std::is_same_v<ActionT, Continue> ||
                 std::is_same_v<ActionT, Hover>) {
                 attachMotionGoal<ActionT>(handle);
@@ -356,7 +360,6 @@ rclcpp_action::GoalResponse ActionManager::handleArmGoal(
         RCLCPP_WARN(
             get_logger(),
             "Arm/Disarm rejected: another task is active");
-
         return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -372,7 +375,6 @@ rclcpp_action::GoalResponse ActionManager::handleArmGoal(
             "%s rejected: %s",
             desired_arm ? "Arm" : "Disarm",
             admission.reason.c_str());
-
         return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -399,7 +401,6 @@ rclcpp_action::GoalResponse ActionManager::handleTakeoffGoal(
         RCLCPP_WARN(
             get_logger(),
             "Takeoff rejected: height must be finite and >= 0");
-
         return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -411,7 +412,6 @@ rclcpp_action::GoalResponse ActionManager::handleTakeoffGoal(
             get_logger(),
             "Takeoff rejected: %s",
             admission.reason.c_str());
-
         return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -451,7 +451,6 @@ rclcpp_action::GoalResponse ActionManager::handleGoToGoal(
         RCLCPP_WARN(
             get_logger(),
             "GoTo rejected: requires finite map/ENU position and yaw");
-
         return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -463,7 +462,6 @@ rclcpp_action::GoalResponse ActionManager::handleGoToGoal(
             get_logger(),
             "GoTo rejected: %s",
             admission.reason.c_str());
-
         return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -477,16 +475,64 @@ rclcpp_action::GoalResponse ActionManager::handleGoToGoal(
 
     operation.request.planner_type = PlannerType::FIXED;
     operation.request.frame_id = "map";
-
     operation.request.target_position = Eigen::Vector3d(
         goal.position.x,
         goal.position.y,
         goal.position.z);
-
     operation.request.target_yaw = goal.yaw;
     operation.request.yaw_direction = 0;
     operation.request.controller_id = "position_yaw_pid";
     operation.request.config_name = "default";
+
+    motion_.emplace(std::move(operation));
+    paused_.reset();
+
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::GoalResponse ActionManager::handleLandGoal(
+    const GoalUUID& uuid,
+    const Land::Goal& goal)
+{
+    refreshSnapshot();
+
+    if (active_ || motion_ || stop_)
+        return rclcpp_action::GoalResponse::REJECT;
+
+    // 保留 action 字段兼容性，但本版不控制下降速度。
+    if (!std::isfinite(goal.descent_speed) ||
+        goal.descent_speed < 0.0) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Land rejected: descent_speed must be finite and >= 0");
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    const auto admission =
+        fsm_->check_action(ActionType::LAND);
+
+    if (!admission.accepted) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Land rejected: %s",
+            admission.reason.c_str());
+        return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    if (goal.descent_speed > 0.0) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Land descent_speed is ignored: "
+            "POINT descent uses the existing controller configuration");
+    }
+
+    MotionOperation operation;
+    operation.uuid = uuid;
+    operation.type = ActionType::LAND;
+    operation.source_type = ActionType::LAND;
+    operation.constraints = land_constraints_;
+    operation.confirmation_timeout =
+        land_confirmation_timeout_;
 
     motion_.emplace(std::move(operation));
     paused_.reset();
@@ -499,13 +545,13 @@ rclcpp_action::GoalResponse ActionManager::handleStopGoal(
 {
     refreshSnapshot();
 
-    // Stop 仅抢占运动任务，不撤销不可撤回的 Arm 服务。
+    // Stop 不撤销已发送或正在准备发送的 Arm/Disarm 服务。
+    // Land 的内部 Disarm 阶段同样占用 active_。
     if (active_ || stop_)
         return rclcpp_action::GoalResponse::REJECT;
 
     StopOperation operation;
     operation.uuid = uuid;
-
     stop_.emplace(std::move(operation));
 
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -525,9 +571,12 @@ rclcpp_action::GoalResponse ActionManager::handleContinueGoal(
         saved.source_type == ActionType::TAKEOFF &&
         fsm_->phase() == FlightPhase::GROUNDED;
 
-    const auto transition_type = resume_ground_takeoff
-        ? ActionType::TAKEOFF
-        : ActionType::GOTO;
+    const auto transition_type =
+        saved.source_type == ActionType::LAND
+            ? ActionType::LAND
+            : (resume_ground_takeoff
+                ? ActionType::TAKEOFF
+                : ActionType::GOTO);
 
     const auto admission =
         fsm_->check_action(transition_type);
@@ -537,7 +586,6 @@ rclcpp_action::GoalResponse ActionManager::handleContinueGoal(
             get_logger(),
             "Continue rejected: %s",
             admission.reason.c_str());
-
         return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -593,13 +641,11 @@ rclcpp_action::GoalResponse ActionManager::handleHoverGoal(
             get_logger(),
             "Hover rejected: %s",
             admission.reason.c_str());
-
         return rclcpp_action::GoalResponse::REJECT;
     }
 
     MotionOperation operation;
     operation.uuid = uuid;
-
     operation.type = ActionType::GOTO;
     operation.source_type = ActionType::HOVER;
     operation.is_hover = true;
@@ -631,7 +677,6 @@ rclcpp_action::CancelResponse ActionManager::handleArmCancel(
         RCLCPP_WARN(
             get_logger(),
             "Arm/Disarm cancel rejected: request already sent");
-
         return rclcpp_action::CancelResponse::REJECT;
     }
 
@@ -645,6 +690,18 @@ rclcpp_action::CancelResponse ActionManager::handleMotionCancel(
 {
     if (!motion_ || motion_->uuid != uuid)
         return rclcpp_action::CancelResponse::REJECT;
+
+    if (motion_->landing_disarm) {
+        // 服务发送后无法撤回，不接纳取消。
+        if (!active_ || active_->request_sent)
+            return rclcpp_action::CancelResponse::REJECT;
+
+        motion_->cancel_requested = true;
+        active_->cancel_requested = true;
+        paused_.reset();
+
+        return rclcpp_action::CancelResponse::ACCEPT;
+    }
 
     motion_->cancel_requested = true;
     paused_.reset();
@@ -730,9 +787,10 @@ void ActionManager::attachArmGoal(
                 handle->succeed(result);
             }
             else if (state == ActionState::CANCELED) {
-                if (!handle->is_canceling())
-                    throw std::logic_error("Arm goal is not CANCELING");
-
+                if (!handle->is_canceling()) {
+                    throw std::logic_error(
+                        "Arm goal is not CANCELING");
+                }
                 handle->canceled(result);
             }
             else {
@@ -776,7 +834,9 @@ void ActionManager::attachMotionGoal(
             feedback->phase = phase;
             feedback->progress = progress;
 
-            if constexpr (std::is_same_v<ActionT, Takeoff>) {
+            if constexpr (
+                std::is_same_v<ActionT, Takeoff> ||
+                std::is_same_v<ActionT, Land>) {
                 feedback->current_height = value;
             }
             else if constexpr (
@@ -814,7 +874,6 @@ void ActionManager::attachMotionGoal(
                     throw std::logic_error(
                         "Motion goal is not CANCELING");
                 }
-
                 handle->canceled(result);
             }
             else {
@@ -871,9 +930,10 @@ void ActionManager::attachStopGoal(
                 handle->succeed(result);
             }
             else if (state == ActionState::CANCELED) {
-                if (!handle->is_canceling())
-                    throw std::logic_error("Stop goal is not CANCELING");
-
+                if (!handle->is_canceling()) {
+                    throw std::logic_error(
+                        "Stop goal is not CANCELING");
+                }
                 handle->canceled(result);
             }
             else {
@@ -1133,6 +1193,52 @@ void ActionManager::tick()
             if (!motion_->attached)
                 return;
 
+            if (motion_->landing_disarm) {
+                if (!active_) {
+                    latchFault(
+                        "Land Disarm stage has no active service operation");
+
+                    finishMotion(
+                        ActionState::FAILED,
+                        ErrorCode::INTERNAL_ERROR,
+                        "Land Disarm stage has no active service operation");
+                    return;
+                }
+
+                if (fsm_->phase() == FlightPhase::FAULT) {
+                    finishActive(
+                        ActionState::FAILED,
+                        ErrorCode::VEHICLE_FAULT,
+                        fsm_->fault_reason());
+                    return;
+                }
+
+                // 已接纳的取消优先处理，避免取消后再报告成功。
+                if (active_->cancel_requested) {
+                    tickArm();
+                    return;
+                }
+
+                const auto observation = fsm_->snapshot();
+
+                // PX4 可能已在落地后自动 Disarm。
+                // 尚未发送服务时，使用当前真实状态完成内部步骤。
+                if (!active_->request_sent &&
+                    observation.armed_valid &&
+                    !observation.armed &&
+                    observation.landed_valid &&
+                    observation.landed) {
+                    finishActive(
+                        ActionState::SUCCEEDED,
+                        ErrorCode::NONE,
+                        "Actual Disarm already confirmed");
+                    return;
+                }
+
+                tickArm();
+                return;
+            }
+
             if (fsm_->phase() == FlightPhase::FAULT &&
                 motion_->failure.empty()) {
                 motion_->failure =
@@ -1160,6 +1266,18 @@ void ActionManager::tick()
         if (stop_) {
             failStop(
                 std::string("Stop processing exception: ") +
+                error.what());
+            return;
+        }
+
+        if (motion_ && motion_->landing_disarm && active_) {
+            latchFault(
+                std::string("Land Disarm exception: ") +
+                error.what());
+
+            finishActive(
+                ActionState::FAILED,
+                ErrorCode::INTERNAL_ERROR,
                 error.what());
             return;
         }
@@ -1320,7 +1438,6 @@ void ActionManager::tickArm()
             active_->desired_arm ? "true" : "false",
             static_cast<long long>(
                 active_->request->request_id));
-
         return;
     }
 
@@ -1506,6 +1623,29 @@ void ActionManager::startMotion()
         request.controller_id = "position_yaw_pid";
         request.config_name = "default";
     }
+    else if (motion_->type == ActionType::LAND &&
+             !motion_->resumed_target) {
+        if (position.z <= LAND_TARGET_Z) {
+            finishMotion(
+                ActionState::FAILED,
+                ErrorCode::STATE_REJECTED,
+                "Land requires current map z above -1.0");
+            return;
+        }
+
+        request.planner_type = PlannerType::FIXED;
+        request.frame_id = "map";
+
+        request.target_position = Eigen::Vector3d(
+            position.x,
+            position.y,
+            LAND_TARGET_Z);
+
+        request.target_yaw = measuredYaw(raw.attitude.message);
+        request.yaw_direction = 0;
+        request.controller_id = "position_yaw_pid";
+        request.config_name = "default";
+    }
     else if (motion_->is_hover && !motion_->resumed_target) {
         request.planner_type = PlannerType::FIXED;
         request.frame_id = "map";
@@ -1550,10 +1690,14 @@ void ActionManager::startMotion()
     motion_->initial_distance = initial_distance;
     motion_->motion = planning.motion;
 
-    const auto transition = fsm_->process_event(
+    const auto start_event =
         motion_->type == ActionType::TAKEOFF
             ? FlightEvent::TAKEOFF_STARTED
-            : FlightEvent::GOTO_STARTED);
+            : (motion_->type == ActionType::LAND
+                ? FlightEvent::LAND_STARTED
+                : FlightEvent::GOTO_STARTED);
+
+    const auto transition = fsm_->process_event(start_event);
 
     if (!transition.accepted) {
         finishMotion(
@@ -1660,6 +1804,136 @@ bool ActionManager::motionAtTarget() const
             motion_->constraints.yaw_tolerance;
 }
 
+bool ActionManager::landingConfirmed() const
+{
+    if (!motion_ || motion_->type != ActionType::LAND)
+        return false;
+
+    const auto observation = fsm_->snapshot();
+
+    if (!observation.connected_valid ||
+        !observation.connected ||
+        !observation.armed_valid ||
+        !observation.landed_valid ||
+        !observation.landed ||
+        !observation.position_valid ||
+        !observation.velocity_valid ||
+        !observation.attitude_valid ||
+        !observation.control_status_valid ||
+        !observation.control_available ||
+        !observation.control_hover ||
+        observation.control_fault ||
+        observation.execution_active) {
+        return false;
+    }
+
+    const auto raw = motion_executor_->getStateSnapshot();
+    const auto now = Clock::now();
+
+    const double timeout =
+        motion_executor_->get_parameter(
+            "execution.state_timeout").as_double();
+
+    if (!freshCache(raw.position, now, timeout) ||
+        !freshCache(raw.velocity, now, timeout) ||
+        !freshCache(raw.attitude, now, timeout) ||
+        raw.position.message.header.frame_id != "map" ||
+        raw.velocity.message.header.frame_id != "map" ||
+        raw.attitude.message.header.frame_id != "map") {
+        return false;
+    }
+
+    const auto& p = raw.position.message.point;
+    const auto& v = raw.velocity.message.vector;
+    const auto& target = motion_->motion.target_position;
+
+    // -1.0 是触发下降的参考点，不要求飞机实际到达地下高度。
+    const double horizontal_error =
+        std::hypot(p.x - target.x(), p.y - target.y());
+
+    const double speed = std::hypot(v.x, v.y, v.z);
+
+    const double delta =
+        measuredYaw(raw.attitude.message) -
+        motion_->motion.target_yaw;
+
+    const double yaw_error =
+        std::abs(std::atan2(std::sin(delta), std::cos(delta)));
+
+    return
+        horizontal_error <=
+            motion_->constraints.position_tolerance &&
+        speed <=
+            motion_->constraints.velocity_tolerance &&
+        yaw_error <=
+            motion_->constraints.yaw_tolerance;
+}
+
+void ActionManager::beginLandDisarm()
+{
+    if (!motion_ ||
+        motion_->type != ActionType::LAND ||
+        active_) {
+        throw std::logic_error(
+            "Invalid Land Disarm operation state");
+    }
+
+    ArmOperation operation;
+    operation.uuid = motion_->uuid;
+    operation.desired_arm = false;
+    operation.attached = true;
+    operation.started_at = Clock::now();
+
+    operation.feedback =
+        [this](std::uint8_t, const std::string&)
+        {
+            if (!motion_ || !motion_->feedback)
+                return;
+
+            const auto raw = motion_executor_->getStateSnapshot();
+            const auto now = Clock::now();
+
+            const double timeout =
+                motion_executor_->get_parameter(
+                    "execution.state_timeout").as_double();
+
+            if (!freshCache(raw.position, now, timeout) ||
+                raw.position.message.header.frame_id != "map") {
+                return;
+            }
+
+            const auto& p = raw.position.message.point;
+            double value = p.z;
+
+            if (motion_->is_continue) {
+                const auto& target = motion_->motion.target_position;
+                value = std::hypot(
+                    p.x - target.x(),
+                    p.y - target.y(),
+                    p.z - target.z());
+            }
+
+            motion_->feedback("DISARMING", 1.0F, value);
+        };
+
+    operation.finish =
+        [this](
+            ActionState state,
+            ErrorCode error,
+            const std::string& message)
+        {
+            finishMotion(
+                state,
+                error,
+                state == ActionState::SUCCEEDED
+                    ? "Landing and actual Disarm confirmed"
+                    : "Landing confirmed; Disarm stage: " + message);
+        };
+
+    motion_->landing_disarm = true;
+    active_.emplace(std::move(operation));
+}
+
 // ============================================================
 // Motion progress and feedback
 // ============================================================
@@ -1690,6 +1964,26 @@ double ActionManager::motionProgress() const
         return motion_->progress_base;
 
     const auto& p = raw.position.message.point;
+
+    if (motion_->source_type == ActionType::LAND) {
+        if (motion_->terminal_event &&
+            motion_->terminal_event->outcome ==
+                MotionExecutor::ExecutionOutcome::COMPLETED &&
+            motion_->terminal_event->safe_stop_confirmed) {
+            return 1.0;
+        }
+
+        const double total =
+            motion_->start_z - LAND_TARGET_Z;
+
+        if (total <= 0.0)
+            return motion_->progress_base;
+
+        return std::clamp(
+            (motion_->start_z - p.z) / total,
+            0.0,
+            0.99);
+    }
 
     if (motion_->source_type == ActionType::TAKEOFF &&
         !motion_->is_continue) {
@@ -1769,6 +2063,11 @@ void ActionManager::publishMotionFeedback()
 
     if (motion_->is_hover && !motion_->is_continue) {
         value = motion_->hover_elapsed_before;
+    }
+    else if (
+        motion_->source_type == ActionType::LAND &&
+        !motion_->is_continue) {
+        value = p.z;
     }
     else if (
         motion_->type == ActionType::TAKEOFF &&
@@ -1925,6 +2224,30 @@ void ActionManager::tickMotion()
                         ActionState::CANCELED,
                         ErrorCode::CANCELED,
                         "Motion canceled after confirmed safe stop");
+                    return;
+                }
+            }
+        }
+        else if (motion_->type == ActionType::LAND) {
+            if (landingConfirmed()) {
+                const auto transition =
+                    fsm_->process_event(FlightEvent::LAND_COMPLETED);
+
+                if (transition.accepted) {
+                    paused_.reset();
+
+                    if (land_auto_disarm_ &&
+                        observation.armed) {
+                        beginLandDisarm();
+                        return;
+                    }
+
+                    finishMotion(
+                        ActionState::SUCCEEDED,
+                        ErrorCode::NONE,
+                        observation.armed
+                            ? "Landing confirmed; vehicle remains armed"
+                            : "Landing confirmed; vehicle is disarmed");
                     return;
                 }
             }
@@ -2110,7 +2433,6 @@ ActionManager::capturePausedTask() const
 
     PausedTask saved;
     saved.source_type = motion_->source_type;
-
     saved.constraints = motion_->constraints;
     saved.confirmation_timeout =
         motion_->confirmation_timeout;
@@ -2156,19 +2478,14 @@ ActionManager::capturePausedTask() const
     if (motion_->trajectory_id) {
         saved.request.planner_type = PlannerType::FIXED;
         saved.request.frame_id = motion_->motion.frame_id;
-
         saved.request.target_position =
             motion_->motion.target_position;
-
         saved.request.target_yaw =
             motion_->motion.target_yaw;
-
         saved.request.yaw_direction =
             motion_->motion.yaw_direction;
-
         saved.request.controller_id =
             motion_->motion.controller_id;
-
         saved.request.config_name =
             motion_->motion.config_name;
     }
@@ -2194,17 +2511,26 @@ ActionManager::capturePausedTask() const
         if (motion_->type == ActionType::TAKEOFF &&
             !motion_->resumed_target) {
             saved.start_z = p.z;
-
             saved.request.target_position = Eigen::Vector3d(
                 p.x, p.y, p.z + motion_->height);
-
             saved.request.target_yaw =
                 measuredYaw(raw.attitude.message);
         }
-        else if (motion_->is_hover && !motion_->resumed_target) {
-            saved.request.target_position =
-                Eigen::Vector3d(p.x, p.y, p.z);
+        else if (motion_->type == ActionType::LAND &&
+                 !motion_->resumed_target) {
+            if (p.z <= LAND_TARGET_Z)
+                return std::nullopt;
 
+            saved.start_z = p.z;
+            saved.request.target_position = Eigen::Vector3d(
+                p.x, p.y, LAND_TARGET_Z);
+            saved.request.target_yaw =
+                measuredYaw(raw.attitude.message);
+        }
+        else if (motion_->is_hover &&
+                 !motion_->resumed_target) {
+            saved.request.target_position = Eigen::Vector3d(
+                p.x, p.y, p.z);
             saved.request.target_yaw =
                 measuredYaw(raw.attitude.message);
         }
@@ -2302,7 +2628,6 @@ void ActionManager::tickStop()
             MotionExecutor::ControlCommand command;
             command.command =
                 MotionExecutor::ControlCommand::CANCEL;
-
             motion_executor_->sendCommand(command);
         }
 
@@ -2384,7 +2709,14 @@ void ActionManager::tickStop()
         paused_.reset();
     }
     else if (motion_) {
-        paused_ = capturePausedTask();
+        // 已落地的 Land 无需保存为可继续任务。
+        if (motion_->source_type == ActionType::LAND &&
+            observation.landed) {
+            paused_.reset();
+        }
+        else {
+            paused_ = capturePausedTask();
+        }
     }
 
     if (stop_->feedback) {
@@ -2405,7 +2737,7 @@ void ActionManager::tickStop()
                 : "Preempted by Stop; original Goal will not resume");
     }
 
-    // 原任务的终态发送异常也属于故障，不能再报告 Stop 成功。
+    // 原任务终态发送异常时，不能再报告 Stop 成功。
     if (fsm_->phase() == FlightPhase::FAULT) {
         finishStop(
             ActionState::FAILED,
@@ -2432,7 +2764,6 @@ void ActionManager::failStop(const std::string& reason)
 {
     const std::string text = reason;
 
-    // 即使停止事务异常，也尽力请求底层停止。
     if (motion_ && motion_->trajectory_id) {
         try {
             motion_executor_->requestStop(

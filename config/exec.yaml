@@ -58,3 +58,11 @@ action_manager:
     stop:
       timeout: 8.0
       settle_duration: 0.5
+    land:
+      position_tolerance: 0.15
+      yaw_tolerance: 0.10
+      velocity_tolerance: 0.15
+      settle_duration: 0.8
+      timeout: 30.0
+      confirmation_timeout: 2.0
+      auto_disarm: true

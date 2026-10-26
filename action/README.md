@@ -615,3 +615,35 @@ Hover 使用 phase、progress、elapsed_time。
 
 进度来自真实距离或实际稳定保持时间；
 progress=1 不代替最终 Result。
+
+## Exec 正式版：阶段 9 Land
+
+当前支持 Arm、Disarm、Takeoff、GoTo、Land、Stop、Continue、Hover。
+
+Land 仅从已确认 HOVERING 接纳。
+开始时固定 x0、y0、yaw0，POINT 参考目标为 (x0,y0,-1.0)。
+该策略要求实际地面高于 map z=-1.0，不是通用地形跟随降落。
+
+descent_speed 仅保留接口兼容，有限非负值均可接受，
+但不控制下降速度。实际下降由现有位置控制器配置决定。
+
+新鲜 landed=true 到达后立即 CANCEL，停止追踪地下参考点。
+确认新鲜 HOVER、持续接地及位置/Yaw/速度稳定后，
+FSM 转为 GROUNDED，Land 才能完成。
+不要求位置 z 到达 -1.0。
+
+land.auto_disarm 参数默认 false；当前 config/exec.yaml 显式设为 true。
+启用后，Land Result 还需等待异步 Disarm 服务成功和实际 armed=false。
+若 PX4 已自行上锁，则依据真实状态确认。
+接地前意外失锁仍是故障。
+
+Land Cancel/Stop 沿用安全停止规则。
+空中暂停的 Land 可通过 Continue 重新规划恢复；
+已接地的暂停 Land 不再有效。
+
+Land Feedback.current_height 表示实际 map z。
+progress 是真实下降位置进度；接地确认后为 1。
+progress=1 不代替 Result，自动 Disarm 可能仍在进行。
+
+正常启动使用 drone_node.launch.py，同时启动 Ctrl、Inter 和 Exec。
+启动本身不自动执行飞行任务。

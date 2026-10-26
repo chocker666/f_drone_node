@@ -309,12 +309,15 @@ bool MotionExecutor::validConstraints(
            positive(constraints.velocity_tolerance) &&
            positive(constraints.settle_duration) &&
            positive(constraints.timeout) &&
-           constraints.timeout > constraints.settle_duration;
+           constraints.timeout > constraints.settle_duration &&
+           !(constraints.require_airborne &&
+             constraints.complete_on_landed);
 }
 
 std::string MotionExecutor::stateProblem(
     const StateSnapshot& state,
-    Clock::time_point time) const
+    Clock::time_point time,
+    bool allow_ground_disarmed) const
 {
     if (!fresh(state.position, time))
         return "Position unavailable, invalid or stale";
@@ -339,9 +342,18 @@ std::string MotionExecutor::stateProblem(
         return "Vehicle connection unavailable or disconnected";
     }
 
-    if (!statusFresh(state.armed, time) ||
-        !state.armed.message.data) {
-        return "Vehicle armed state unavailable or disarmed";
+    if (!statusFresh(state.armed, time)) {
+        return "Vehicle armed state unavailable or stale";
+    }
+
+    const bool confirmed_disarmed_on_ground =
+        allow_ground_disarmed &&
+        statusFresh(state.landed, time) &&
+        state.landed.message.data;
+
+    if (!state.armed.message.data &&
+        !confirmed_disarmed_on_ground) {
+        return "Vehicle unexpectedly disarmed";
     }
 
     return {};
@@ -641,7 +653,9 @@ MotionExecutor::finishExecution(bool safe_stop_confirmed)
     switch (context.stop_reason) {
     case StopReason::COMPLETED:
         event.outcome = ExecutionOutcome::COMPLETED;
-        event.message = "Target reached; stable HOVER confirmed";
+        event.message = context.constraints.complete_on_landed
+            ? "Ground contact stable; descending reference canceled"
+            : "Target reached; stable HOVER confirmed";
         break;
 
     case StopReason::STOP:
@@ -705,7 +719,10 @@ void MotionExecutor::updateExecution()
             event = finishExecution(false);
         };
 
-        const std::string problem = stateProblem(state, time);
+        const std::string problem = stateProblem(
+            state,
+            time,
+            context.constraints.complete_on_landed);
 
         // 异常优先于到达与普通完成。
         if (!problem.empty()) {
@@ -719,7 +736,8 @@ void MotionExecutor::updateExecution()
                 std::to_string(status.fault_code));
         }
         else if (
-            context.constraints.require_airborne &&
+            (context.constraints.require_airborne ||
+             context.constraints.complete_on_landed) &&
             !statusFresh(state.landed, time)) {
             fail_now("Landed observation unavailable or stale");
         }
@@ -785,6 +803,19 @@ void MotionExecutor::updateExecution()
                         StopReason::FAILURE,
                         "Execution timeout");
                 }
+                else if (context.constraints.complete_on_landed) {
+                    // Land 不根据地下目标位置完成。
+                    // 首次新鲜接地观测到达后，立即停止下降。
+                    context.stability_started = false;
+
+                    if (state.landed.message.data) {
+                        beginStopping(
+                            context,
+                            state,
+                            time,
+                            StopReason::COMPLETED);
+                    }
+                }
                 else if (
                     context.constraints.require_airborne &&
                     state.landed.message.data) {
@@ -812,17 +843,26 @@ void MotionExecutor::updateExecution()
                         context.stability_started = false;
 
                         if (context.stop_reason ==
-                            StopReason::COMPLETED) {
+                                StopReason::COMPLETED &&
+                            !context.constraints.complete_on_landed) {
                             context.hover_position =
                                 context.trajectory.point_params.position;
+
                             context.hover_yaw =
                                 context.trajectory.point_params.yaw;
                         }
                         else {
+                            // Land 接地后围绕真实接地点确认稳定，
+                            // 不再围绕地下参考点判定。
                             context.hover_position =
                                 state.position.message.point;
+
                             context.hover_yaw =
-                                yawOf(state.attitude.message);
+                                context.constraints.complete_on_landed &&
+                                context.stop_reason ==
+                                    StopReason::COMPLETED
+                                    ? context.trajectory.point_params.yaw
+                                    : yawOf(state.attitude.message);
                         }
                     }
                     else if (
@@ -837,8 +877,27 @@ void MotionExecutor::updateExecution()
                     status.trajectory_id != 0) {
                     fail_now("Ctrl left HOVER during stop confirmation");
                 }
-                else if (settled(context, state, time, true)) {
-                    event = finishExecution(true);
+                else if (
+                    context.constraints.complete_on_landed &&
+                    context.stop_reason == StopReason::COMPLETED &&
+                    !state.landed.message.data) {
+                    // 接地信号回退，不能累计稳定时间。
+                    // 不自动重新启动下降，等待确认或超时。
+                    context.stability_started = false;
+                }
+                else {
+                    const bool stable =
+                        settled(context, state, time, true);
+
+                    const bool ground_confirmed =
+                        !context.constraints.complete_on_landed ||
+                        context.stop_reason != StopReason::COMPLETED ||
+                        (state.landed.message.data &&
+                         state.landed.received_at >
+                             context.stable_since);
+
+                    if (stable && ground_confirmed)
+                        event = finishExecution(true);
                 }
                 break;
 
