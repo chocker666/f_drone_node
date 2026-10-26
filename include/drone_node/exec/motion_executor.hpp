@@ -88,11 +88,12 @@ public:
         double velocity_tolerance{0.15};  // m/s
         double settle_duration{0.5};      // s
         double timeout{30.0};             // s
-    };
-
         // Takeoff must confirm actual airborne state before success.
         // Other tasks leave this disabled.
-    bool require_airborne{false};
+        bool require_airborne{false};
+    };
+
+
 
     struct ExecutionEvent
     {

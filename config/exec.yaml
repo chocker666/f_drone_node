@@ -15,14 +15,6 @@ motion_executor:
     services:
       arm: /px4_interface/in/arm
 
-    # 阶段 6 接入。
-    takeoff:
-      default_height: 1.5
-      position_tolerance: 0.15
-      velocity_tolerance: 0.15
-      settle_duration: 0.5
-      timeout: 15.0
-
     # 阶段 2 接入。
     execution:
       check_frequency: 20.0
