@@ -21,6 +21,7 @@
 
 #include "drone_node/exec/flight_state_machine.hpp"
 #include "drone_node/exec/motion_executor.hpp"
+#include "drone_node/exec/planner/motion_planner.hpp"
 
 namespace drone_node::exec
 {
@@ -67,7 +68,8 @@ private:
         SERVICE_FAILED = 4,
         STATE_REJECTED = 5,
         VEHICLE_FAULT = 6,
-        INTERNAL_ERROR = 7
+        INTERNAL_ERROR = 7,
+        MOTION_FAILED = 8
     };
 
     struct ArmOperation
@@ -95,6 +97,38 @@ private:
             const std::string&)> finish;
     };
 
+    struct TakeoffOperation
+    {
+        GoalUUID uuid{};
+        bool attached{false};
+        bool cancel_requested{false};
+        bool stop_requested{false};
+        bool fsm_started{false};
+
+        double height{0.0};
+        double start_z{0.0};
+
+        PlannedMotion motion;
+        MotionExecutor::ExecutionConstraints constraints;
+
+        std::optional<std::uint64_t> trajectory_id;
+        std::optional<MotionExecutor::ExecutionEvent> terminal_event;
+
+        Clock::time_point dispatched_at{};
+        Clock::time_point event_received_at{};
+        Clock::time_point next_feedback_at{};
+
+        // 非空时优先以失败结束，即使后续停止成功。
+        std::string failure;
+
+        std::function<void(const Takeoff::Feedback&)> feedback;
+
+        std::function<void(
+            ActionState,
+            ErrorCode,
+            const std::string&)> finish;
+    };
+
     template<typename ActionT>
     typename rclcpp_action::Server<ActionT>::SharedPtr createServer(
         const std::string& name);
@@ -110,6 +144,30 @@ private:
     void attachArmGoal(
         const std::shared_ptr<
             rclcpp_action::ServerGoalHandle<ActionT>>& handle);
+
+                rclcpp_action::GoalResponse handleTakeoffGoal(
+        const GoalUUID& uuid,
+        const Takeoff::Goal& goal);
+
+    rclcpp_action::CancelResponse handleTakeoffCancel(
+        const GoalUUID& uuid);
+
+    void attachTakeoffGoal(
+        const std::shared_ptr<
+            rclcpp_action::ServerGoalHandle<Takeoff>>& handle);
+
+    void startTakeoff();
+    void tickTakeoff();
+    void publishTakeoffFeedback();
+    bool takeoffAtTarget() const;
+
+    void finishTakeoff(
+        ActionState state,
+        ErrorCode error,
+        const std::string& message);
+
+    static double measuredYaw(
+        const geometry_msgs::msg::QuaternionStamped& attitude);
 
     void tick();
     void tickArm();
@@ -147,6 +205,13 @@ private:
     // 跨节点执行事件单独通过互斥队列传递。
     std::mutex event_mutex_;
     std::deque<MotionExecutor::ExecutionEvent> execution_events_;
+
+    MotionPlanner planner_;
+    std::optional<TakeoffOperation> takeoff_;
+
+    double takeoff_default_height_{1.5};
+    double takeoff_confirmation_timeout_{2.0};
+    MotionExecutor::ExecutionConstraints takeoff_constraints_;
 
     double service_wait_timeout_{3.0};
     double response_timeout_{6.0};

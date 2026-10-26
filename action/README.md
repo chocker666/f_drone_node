@@ -471,3 +471,49 @@ Action 的最终状态仍以 ROS2 Action 的终止状态为准，`success` 作�
 FSM 锁存 FAULT；不会自动重试、反向操作或自动恢复。
 
 正常数据重新到达不会解除 FAULT。
+
+## Exec 正式版重构：阶段 6 Takeoff
+
+当前支持 Arm、Disarm、Takeoff。
+GoTo、Land、Stop 的 Goal 仍明确拒绝。
+
+### Takeoff.height
+
+- 大于 0：使用 Goal 给出的相对高度增量。
+- 等于 0：使用 action_manager.takeoff.default_height。
+- 小于 0、NaN、无穷值：拒绝 Goal。
+
+### 执行
+
+必须已解锁、真实接地、定位和控制反馈有效，
+并通过 FlightStateMachine 准入。
+
+开始时固定当前位置和 Yaw：
+目标为 (x0, y0, z0 + height)，Yaw 保持 yaw0。
+MotionPlanner/FixedPlanner 生成 POINT，
+控制器为 position_yaw_pid，配置为 default。
+
+必须确认真实离地，再进行到达稳定判定。
+到达后自动 CANCEL，确认 HOVER 和真实稳定状态，
+FSM 转为 HOVERING 后，Action 才 SUCCEEDED。
+
+### Feedback
+
+- current_height：相对任务开始位置的真实高度变化，单位 m。
+- progress：真实高度变化与请求高度之比，限制在 [0, 1]。
+- phase：实际执行或终态确认阶段。
+
+progress=1 不代表 Action 已完成；
+仍需稳定、CANCEL/HOVER 和 FSM 确认。
+
+### Cancel
+
+发布轨迹前可直接取消。
+发布后请求真实停止，确认接地或稳定悬停后才 CANCELED。
+不保留暂停信息，不自动 Disarm。
+故障和无法确认安全停止优先报告 ABORTED。
+
+Result.error_code 新增：
+- 8：运动执行失败。
+
+本阶段不自动解锁，不自动切换 PX4 Offboard。

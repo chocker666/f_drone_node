@@ -718,6 +718,18 @@ void MotionExecutor::updateExecution()
                 "Ctrl FAULT, code=" +
                 std::to_string(status.fault_code));
         }
+        else if (
+            context.constraints.require_airborne &&
+            !statusFresh(state.landed, time)) {
+            fail_now("Landed observation unavailable or stale");
+        }
+        else if (
+            context.constraints.require_airborne &&
+            context.phase == ExecutionPhase::WAITING_HOVER &&
+            context.stop_reason == StopReason::COMPLETED &&
+            state.landed.message.data) {
+            fail_now("Unexpected ground contact during Takeoff completion");
+        }
         else {
             const bool later_status = statusAfter(state, context);
 
@@ -772,6 +784,12 @@ void MotionExecutor::updateExecution()
                         context, state, time,
                         StopReason::FAILURE,
                         "Execution timeout");
+                }
+                else if (
+                    context.constraints.require_airborne &&
+                    state.landed.message.data) {
+                    // 尚未离地不能累计到达稳定时间。
+                    context.stability_started = false;
                 }
                 else if (settled(context, state, time, false)) {
                     beginStopping(

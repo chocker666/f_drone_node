@@ -47,3 +47,12 @@ action_manager:
       response_timeout: 6.0
       observation_timeout: 2.5
       action_timeout: 15.0
+
+    takeoff:
+      default_height: 1.5
+      position_tolerance: 0.15
+      yaw_tolerance: 0.10
+      velocity_tolerance: 0.15
+      settle_duration: 0.5
+      timeout: 15.0
+      confirmation_timeout: 2.0
