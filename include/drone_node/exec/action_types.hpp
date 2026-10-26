@@ -15,7 +15,9 @@ enum class ActionType : std::uint8_t
     TAKEOFF,
     LAND,
     GOTO,
-    STOP
+    STOP,
+    CONTINUE,
+    HOVER
 };
 
 enum class ActionState : std::uint8_t
@@ -141,6 +143,8 @@ inline const char* to_string(ActionType type)
     case ActionType::LAND: return "LAND";
     case ActionType::GOTO: return "GOTO";
     case ActionType::STOP: return "STOP";
+    case ActionType::CONTINUE: return "CONTINUE";
+    case ActionType::HOVER: return "HOVER";
     }
     return "INVALID";
 }

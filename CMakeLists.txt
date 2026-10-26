@@ -50,6 +50,8 @@ set(EXEC_ACTION_FILES
   "action/Arm.action"
   "action/Disarm.action"
   "action/Stop.action"
+  "action/Continue.action"
+  "action/Hover.action"
 )
 
 set(EXEC_SRV_FILES

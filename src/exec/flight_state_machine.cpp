@@ -230,9 +230,11 @@ AdmissionResult FlightStateMachine::check_action_locked(
 
     case ActionType::GOTO:
     case ActionType::LAND:
+    case ActionType::CONTINUE:
+    case ActionType::HOVER:
         if (phase_ != FlightPhase::HOVERING ||
             !hovering_confirmed_locked()) {
-            return {false, "GoTo/Land requires confirmed HOVERING"};
+            return {false, "Action requires confirmed HOVERING"};
         }
 
         return {true, "Airborne action permitted"};

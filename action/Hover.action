@@ -1,0 +1,10 @@
+# Seconds. Zero means succeed after stable hover is confirmed.
+float64 duration
+---
+bool success
+uint16 error_code
+string message
+---
+string phase
+float32 progress
+float64 elapsed_time

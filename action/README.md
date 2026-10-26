@@ -561,3 +561,57 @@ progress=1 不代表 Action 已完成。
 故障和无法确认安全停止优先报告 ABORTED。
 仅处理匹配当前任务轨迹 ID 的执行事件。
 暂停、Continue 和 Stop 留待阶段 8。
+
+## Exec 正式版重构：阶段 8
+
+当前支持 Arm、Disarm、Takeoff、GoTo、Stop、Continue、Hover。
+Land 仍明确拒绝。
+
+### Stop
+
+Stop 抢占普通运动任务，但不撤销已发送的 Arm/Disarm 服务。
+重复的活动 Stop 被拒绝。
+
+必须取得匹配执行事件及请求后的新鲜停止观测，
+连续稳定后才能成功。已处于 HOVER 时不重复发送 CANCEL。
+
+Stop 成功后原运动 Goal 为 ABORTED，error_code=9（PREEMPTED），
+不会 SUCCEEDED。暂停槽保存目标、约束、剩余运动时间预算及任务进度，
+不保存旧 Ctrl 轨迹或旧轨迹 ID。
+
+客户端同时取消原任务时，原任务 CANCELED，不保存暂停信息。
+取消 Stop 不恢复原运动：安全停止后 Stop 为 CANCELED，暂停槽清空。
+异常优先于普通完成，无法确认安全停止时 ABORTED 并锁存 FAULT。
+
+### Continue
+
+Goal 为空，仅恢复唯一有效暂停槽。
+正式接纳即消费暂停槽。
+
+根据当前真实状态调用 MotionPlanner 生成新 POINT，
+使用新的轨迹 ID。旧 GoalHandle 不复活。
+恢复 Takeoff 使用原绝对目标，不再次增加起飞高度。
+
+新运动 Goal 正式接纳后立即清空旧暂停任务。
+观测失效、故障或成功 Disarm 会使暂停任务失效。
+剩余运动预算不足时不生成可恢复任务。
+
+### Hover
+
+Goal.duration 必须有限且 >=0，单位秒。
+仅保持接纳后开始执行时的当前位置和 Yaw。
+
+先建立真实稳定悬停，再开始保持计时。
+duration=0：稳定悬停确认后立即成功，底层继续悬停。
+duration>0：持续满足真实目标约束达指定时间后成功。
+
+Hover 可被 Stop；Continue 重新规划到原保持目标，
+再完成剩余保持时间。保持中 Cancel 也必须确认安全停止。
+
+### 反馈
+
+Continue 使用 phase、progress、remaining_distance。
+Hover 使用 phase、progress、elapsed_time。
+
+进度来自真实距离或实际稳定保持时间；
+progress=1 不代替最终 Result。

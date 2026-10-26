@@ -1,0 +1,8 @@
+---
+bool success
+uint16 error_code
+string message
+---
+string phase
+float32 progress
+float64 remaining_distance
