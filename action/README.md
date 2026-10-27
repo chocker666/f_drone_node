@@ -468,9 +468,13 @@ Action 的最终状态仍以 ROS2 Action 的终止状态为准，`success` 作�
 - 7：内部异常。
 
 请求发送后的失败或超时采用保守策略，Action 为 ABORTED，
-FSM 锁存 FAULT；不会自动重试、反向操作或自动恢复。
+FSM 锁存 FAULT；不会自动重试或反向操作。
 
-正常数据重新到达不会解除 FAULT。
+正常数据重新到达不会解除 FAULT。确认飞行器已连接、落地、解除武装，
+且 Ctrl 可用、无故障、未跟踪后，可调用
+`/drone_node/reset_fault`（`std_srvs/Trigger`）显式复位。
+复位失败会返回原因；成功后清除暂停任务并恢复到 GROUNDED，
+不会自动改变 PX4 的武装状态。
 
 ## Exec 正式版重构：阶段 6 Takeoff
 

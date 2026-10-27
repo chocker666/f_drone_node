@@ -11,6 +11,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include "drone_node/action/arm.hpp"
 #include "drone_node/action/disarm.hpp"
@@ -295,6 +296,12 @@ private:
     void processExecutionEvents();
     void latchFault(const std::string& reason);
 
+    // 手动复位 Exec FAULT。
+    // 仅允许已落地、已锁定且控制器正常时恢复。
+    void handleResetFault(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+
     // 规划及执行确认。
     void startMotion();
     bool motionAtTarget() const;
@@ -352,6 +359,9 @@ private:
     rclcpp_action::Server<Stop>::SharedPtr stop_server_;
     rclcpp_action::Server<Continue>::SharedPtr continue_server_;
     rclcpp_action::Server<Hover>::SharedPtr hover_server_;
+
+    // Exec 故障手动复位服务
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_fault_service_;
 
     rclcpp::TimerBase::SharedPtr timer_;
 

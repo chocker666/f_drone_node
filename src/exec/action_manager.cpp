@@ -214,6 +214,15 @@ ActionManager::ActionManager(
     continue_server_ = createServer<Continue>("/drone_node/continue");
     hover_server_ = createServer<Hover>("/drone_node/hover");
 
+    reset_fault_service_ =
+        create_service<std_srvs::srv::Trigger>(
+            "/drone_node/reset_fault",
+            std::bind(
+                &ActionManager::handleResetFault,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2));
+
     timer_ = create_wall_timer(period, [this] { tick(); });
 
     RCLCPP_INFO(
@@ -1053,6 +1062,108 @@ void ActionManager::latchFault(const std::string& reason)
         "Fault latched: %s",
         reason.c_str());
 }
+
+void ActionManager::handleResetFault(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+    (void)request;
+
+    response->success = false;
+
+    // 1. 必须已经处于 FAULT。
+    if (fsm_->phase() != FlightPhase::FAULT) {
+        response->message = "Exec is not in FAULT";
+        return;
+    }
+
+    // 2. 不允许有尚未结束的 Action 事务。
+    if (active_ || motion_ || stop_) {
+        response->message =
+            "Cannot reset: an Action operation is still active";
+        return;
+    }
+
+    // 3. 不允许存在尚未处理的执行事件。
+    {
+        std::lock_guard<std::mutex> lock(event_mutex_);
+
+        if (!execution_events_.empty()) {
+            response->message =
+                "Cannot reset: pending execution events";
+            return;
+        }
+    }
+
+    // 4. 获取 MotionExecutor 的最新真实观测。
+    refreshSnapshot();
+
+    const auto snapshot = fsm_->snapshot();
+
+    // 5. 必须确认 PX4 已连接。
+    if (!snapshot.connected_valid || !snapshot.connected) {
+        response->message =
+            "Cannot reset: PX4 connection is unavailable";
+        return;
+    }
+
+    // 6. 第一版只允许已锁定、已落地的情况。
+    if (!snapshot.armed_valid || snapshot.armed) {
+        response->message =
+            "Cannot reset: vehicle must be disarmed";
+        return;
+    }
+
+    if (!snapshot.landed_valid || !snapshot.landed) {
+        response->message =
+            "Cannot reset: vehicle must be landed";
+        return;
+    }
+
+    // 7. Ctrl 必须已经停止轨迹执行，且没有故障。
+    if (!snapshot.control_status_valid ||
+        !snapshot.control_available ||
+        snapshot.control_fault ||
+        snapshot.control_tracking ||
+        snapshot.execution_active) {
+        response->message =
+            "Cannot reset: Ctrl is not ready";
+        return;
+    }
+
+    // 8. 调用 FSM 已有的显式恢复事件。
+    // FSM 会再次检查快照新鲜度及控制条件。
+    const auto result =
+        fsm_->process_event(FlightEvent::STATE_RECOVERED);
+
+    if (!result.accepted) {
+        response->message =
+            "FSM recovery rejected: " + result.reason;
+
+        RCLCPP_WARN(
+            get_logger(),
+            "%s",
+            response->message.c_str());
+
+        return;
+    }
+
+    // 9. 清除失效的暂停任务。
+    // 不调用 MotionExecutor 的运动命令，
+    // 不改变 PX4 Arm 状态。
+    paused_.reset();
+
+    response->success = true;
+    response->message =
+        "Exec FAULT cleared; flight phase is GROUNDED";
+
+    RCLCPP_INFO(
+        get_logger(),
+        "Manual FAULT reset succeeded: %s -> %s",
+        to_string(result.previous),
+        to_string(result.current));
+}
+
 
 // ============================================================
 // Terminal delivery

@@ -2,6 +2,8 @@ px4_interface:
   ros__parameters:
     frame_id: map
 
+    offboard_warmup: 1.5
+    offboard_retry_interval: 2.0
     connection_timeout: 1.0
     setpoint_timeout: 0.5
     command_timeout: 2.0

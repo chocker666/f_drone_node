@@ -30,6 +30,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <algorithm>
 
 namespace ft = drone_node::frame_transforms;
 
@@ -161,6 +162,17 @@ struct PX4Interface::Impl
     bool reported_connected{false};
     uint64_t status_sequence{0};
 
+    uint8_t px4_nav_state{0};
+    bool px4_position_valid{false};
+
+    Time offboard_heartbeat_started{};
+    Time last_offboard_request{};
+
+    double offboard_warmup;
+    double offboard_retry_interval;
+
+    bool offboard_requested{false};
+
     bool pending{false};
     bool desired_arm{false};
     bool reply_received{false};
@@ -244,6 +256,8 @@ struct PX4Interface::Impl
         if (frame.empty())
             throw std::invalid_argument("frame_id must not be empty");
 
+        offboard_warmup = positive("offboard_warmup", 1.5);
+        offboard_retry_interval = positive("offboard_retry_interval", 2.0);
         connection_timeout = positive("connection_timeout", 1.0);
         setpoint_timeout = positive("setpoint_timeout", 0.5);
         command_timeout = positive("command_timeout", 2.0);
@@ -354,6 +368,7 @@ struct PX4Interface::Impl
             },
             rmw_qos_profile_services_default, command_group);
 
+        timer(2.0, command_group, [this] {manage_offboard(); });
         timer(connection_rate, command_group, [this] { publish_connection(); });
         timer(20.0, command_group, [this] { check_command(); });
         timer(setpoint_rate, control_group, [this] { publish_setpoint(); });
@@ -377,6 +392,7 @@ struct PX4Interface::Impl
         has_status = true;
         ++status_sequence;
         px4_armed = msg.arming_state == Status::ARMING_STATE_ARMED;
+        px4_nav_state = msg.nav_state;
 
         Bool out;
         out.data = connected(status_received) && px4_armed;
@@ -427,6 +443,7 @@ struct PX4Interface::Impl
             out.vector.z = value.z();
             velocity_pub->publish(out);
         }
+        px4_position_valid = msg.xy_valid && msg.z_valid;
     }
 
     void attitude_callback(const Attitude &msg)
@@ -558,6 +575,8 @@ struct PX4Interface::Impl
         out.attitude = published_mode == Setpoint::ATTITUDE;
         out.body_rate = published_mode == Setpoint::BODY_RATE;
         mode_pub->publish(out);
+        if (offboard_heartbeat_started == Time{})
+            offboard_heartbeat_started = Clock::now();
     }
 
     void respond(const Header &header, bool success, const std::string &message)
@@ -688,6 +707,88 @@ struct PX4Interface::Impl
                    px4_armed == desired_arm) {
             finish(true, "STATE_CONFIRMED");
         }
+    }
+
+    void manage_offboard()
+    {
+        const auto now = Clock::now();
+
+        if (!connected(now) || !px4_position_valid) {
+            return;
+        }
+
+        if (px4_nav_state == Status::NAVIGATION_STATE_OFFBOARD) {
+            offboard_requested = true;
+            return;
+        }
+
+        // 飞行过程中退出 Offboard，禁止自动抢占控制权
+        if (px4_armed) {
+            return;
+        }
+
+        if (offboard_heartbeat_started == Time{}) {
+            return;
+        }
+
+        if (age(now, offboard_heartbeat_started) <
+            offboard_warmup) {
+            return;
+        }
+
+        if (last_offboard_request != Time{} &&
+            age(now, last_offboard_request) <
+                offboard_retry_interval) {
+            return;
+        }
+
+        if (!command_client->service_is_ready()) {
+            return;
+        }
+
+        auto request = std::make_shared<Command::Request>();
+        auto& cmd = request->request;
+
+        cmd.timestamp = timestamp();
+        cmd.command =
+            px4_msgs::msg::VehicleCommand::
+                VEHICLE_CMD_DO_SET_MODE;
+
+        cmd.param1 = 1.0f;
+        cmd.param2 = 6.0f;
+
+        cmd.target_system = target_system;
+        cmd.target_component = target_component;
+        cmd.source_system = source_system;
+        cmd.source_component = source_component;
+        cmd.from_external = true;
+
+        last_offboard_request = now;
+
+        command_client->async_send_request(
+            request,
+            [this](Client::SharedFuture future) {
+                try {
+                    const auto& reply = future.get()->reply;
+
+                    if (reply.result ==
+                        Ack::VEHICLE_CMD_RESULT_ACCEPTED) {
+                        RCLCPP_INFO(
+                            node.get_logger(),
+                            "Offboard mode command accepted");
+                    } else {
+                        RCLCPP_WARN(
+                            node.get_logger(),
+                            "Offboard mode command rejected: %u",
+                            static_cast<unsigned>(reply.result));
+                    }
+                } catch (const std::exception& error) {
+                    RCLCPP_ERROR(
+                        node.get_logger(),
+                        "Offboard command error: %s",
+                        error.what());
+                }
+            });
     }
 };
 
