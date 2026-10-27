@@ -344,7 +344,7 @@ private:
         const geometry_msgs::msg::QuaternionStamped& attitude);
 
     // map 坐标系绝对高度，非相对当前位置下降 1 米。
-    static constexpr double LAND_TARGET_Z = -1.0;
+    static constexpr double LAND_TARGET_Z = -0.1;
 
     std::shared_ptr<MotionExecutor> motion_executor_;
     std::shared_ptr<FlightStateMachine> fsm_;

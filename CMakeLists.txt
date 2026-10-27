@@ -206,28 +206,6 @@ target_link_libraries(drone_node_exec
   "${cpp_typesupport_target}"
 )
 
-# ============================================================
-# Attitude test executable
-# ============================================================
-
-add_executable(attitude_test
-  test/inter/attitude_test.cpp
-)
-
-target_include_directories(attitude_test PUBLIC
-  ${DRONE_INCLUDE_DIR}
-)
-
-ament_target_dependencies(attitude_test
-  rclcpp
-  geometry_msgs
-)
-
-target_link_libraries(attitude_test
-  Eigen3::Eigen
-  "${cpp_typesupport_target}"
-)
-
 
 # ============================================================
 # Motion Executor executable
@@ -237,6 +215,12 @@ add_executable(motion_executor_exec
   src/main/exec_main.cpp
   src/exec/motion_executor.cpp
   src/exec/action_manager.cpp
+  src/exec/actions/arm.cpp
+  src/exec/actions/motion.cpp
+  src/exec/actions/motion_feedback.cpp
+  src/exec/actions/motion_tick.cpp
+  src/exec/actions/hover.cpp
+  src/exec/actions/stop.cpp
   src/exec/flight_state_machine.cpp
   src/exec/planner/motion_planner.cpp
   src/exec/planner/fixed_planner.cpp
@@ -269,7 +253,6 @@ install(TARGETS
   px4_interface_exec
   flight_controller_exec
   motion_executor_exec
-  attitude_test
   DESTINATION lib/${PROJECT_NAME}
 )
 
