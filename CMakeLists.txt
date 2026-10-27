@@ -206,28 +206,6 @@ target_link_libraries(drone_node_exec
   "${cpp_typesupport_target}"
 )
 
-# ============================================================
-# Attitude test executable
-# ============================================================
-
-add_executable(attitude_test
-  test/inter/attitude_test.cpp
-)
-
-target_include_directories(attitude_test PUBLIC
-  ${DRONE_INCLUDE_DIR}
-)
-
-ament_target_dependencies(attitude_test
-  rclcpp
-  geometry_msgs
-)
-
-target_link_libraries(attitude_test
-  Eigen3::Eigen
-  "${cpp_typesupport_target}"
-)
-
 
 # ============================================================
 # Motion Executor executable
