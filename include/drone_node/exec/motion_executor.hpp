@@ -26,7 +26,7 @@
 namespace drone_node::exec
 {
 
-class MotionExecutor : public rclcpp::Node
+class MotionExecutor
 {
 public:
     using Clock = std::chrono::steady_clock;
@@ -119,7 +119,10 @@ public:
         std::function<void(const ExecutionEvent&)>;
 
     explicit MotionExecutor(
-        const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
+        rclcpp::Node& node, rclcpp::CallbackGroup::SharedPtr motion_group);
+
+    // Executor workers must be stopped before calling. Idempotent, no waiting.
+    void stop();
 
     // 仅发布，不等待 Ctrl 确认或轨迹执行完成。
     void sendTrajectory(const ControlTrajectory& trajectory);
@@ -165,6 +168,8 @@ public:
     // 面向 FSM 的真实观测快照，不改变 FSM 状态。
     VehicleSnapshot getVehicleSnapshot() const;
 private:
+    rclcpp::Node& node_;
+    rclcpp::CallbackGroup::SharedPtr motion_group_;
 
     struct ExecutionContext
     {

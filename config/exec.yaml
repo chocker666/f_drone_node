@@ -1,4 +1,4 @@
-motion_executor:
+exec_node:
   ros__parameters:
     topics:
       trajectory: /flight_controller/in/trajectory
@@ -29,8 +29,6 @@ motion_executor:
       hover_yaw_tolerance: 0.10
       hover_velocity_tolerance: 0.15
       hover_settle_duration: 0.5
-action_manager:
-  ros__parameters:
     check_frequency: 20.0
     feedback_frequency: 5.0
 

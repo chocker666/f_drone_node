@@ -232,14 +232,14 @@ void ActionManager::tickMotion()
 
         if (!accepted) {
             RCLCPP_WARN(
-                get_logger(),
+                node_.get_logger(),
                 "Motion stop request not attached; "
                 "waiting for matching terminal event");
         }
     }
 
     const double executor_stop_timeout =
-        motion_executor_->get_parameter(
+        node_.get_parameter(
             "execution.stop_timeout").as_double();
 
     const double result_timeout =

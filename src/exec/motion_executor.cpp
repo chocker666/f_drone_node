@@ -11,30 +11,36 @@
 namespace drone_node::exec
 {
 
-MotionExecutor::MotionExecutor(const rclcpp::NodeOptions& options)
-    : rclcpp::Node("motion_executor", options)
+MotionExecutor::MotionExecutor(
+    rclcpp::Node& node, rclcpp::CallbackGroup::SharedPtr motion_group)
+    : node_(node), motion_group_(std::move(motion_group))
 {
+    if (!motion_group_)
+        throw std::invalid_argument("MotionExecutor requires motion callback group");
+    rclcpp::SubscriptionOptions subscription_options;
+    subscription_options.callback_group = motion_group_;
+
     const auto topic = [this](
         const std::string& parameter,
         const std::string& default_value)
     {
-        return declare_parameter<std::string>(
+        return node_.declare_parameter<std::string>(
             parameter, default_value);
     };
 
-    trajectory_pub_ = create_publisher<ControlTrajectory>(
+    trajectory_pub_ = node_.create_publisher<ControlTrajectory>(
         topic(
             "topics.trajectory",
             "/flight_controller/in/trajectory"),
         rclcpp::QoS(1).reliable());
 
-    command_pub_ = create_publisher<ControlCommand>(
+    command_pub_ = node_.create_publisher<ControlCommand>(
         topic(
             "topics.command",
             "/flight_controller/in/command"),
         rclcpp::QoS(10).reliable());
 
-    control_status_sub_ = create_subscription<ControlStatus>(
+    control_status_sub_ = node_.create_subscription<ControlStatus>(
         topic(
             "topics.control_status",
             "/flight_controller/out/control_status"),
@@ -45,12 +51,12 @@ MotionExecutor::MotionExecutor(const rclcpp::NodeOptions& options)
             // FAULT 是有效状态报告，不应因为处于 FAULT 而丢弃。
             const bool valid = message->state <= ControlStatus::FAULT;
             updateCache(state_.control_status, *message, valid);
-        });
+        }, subscription_options);
 
     const auto state_qos = rclcpp::QoS(1).reliable();
 
     position_sub_ =
-        create_subscription<geometry_msgs::msg::PointStamped>(
+        node_.create_subscription<geometry_msgs::msg::PointStamped>(
             topic(
                 "topics.position",
                 "/px4_interface/out/position"),
@@ -65,10 +71,10 @@ MotionExecutor::MotionExecutor(const rclcpp::NodeOptions& options)
                     std::isfinite(position.z);
 
                 updateCache(state_.position, *message, valid);
-            });
+            }, subscription_options);
 
     velocity_sub_ =
-        create_subscription<geometry_msgs::msg::Vector3Stamped>(
+        node_.create_subscription<geometry_msgs::msg::Vector3Stamped>(
             topic(
                 "topics.velocity",
                 "/px4_interface/out/velocity"),
@@ -83,10 +89,10 @@ MotionExecutor::MotionExecutor(const rclcpp::NodeOptions& options)
                     std::isfinite(velocity.z);
 
                 updateCache(state_.velocity, *message, valid);
-            });
+            }, subscription_options);
 
     attitude_sub_ =
-        create_subscription<geometry_msgs::msg::QuaternionStamped>(
+        node_.create_subscription<geometry_msgs::msg::QuaternionStamped>(
             topic(
                 "topics.attitude",
                 "/px4_interface/out/attitude"),
@@ -108,25 +114,25 @@ MotionExecutor::MotionExecutor(const rclcpp::NodeOptions& options)
                     std::abs(norm - 1.0) <= 1.0e-3;
 
                 updateCache(state_.attitude, *message, valid);
-            });
+            }, subscription_options);
 
-    armed_sub_ = create_subscription<std_msgs::msg::Bool>(
+    armed_sub_ = node_.create_subscription<std_msgs::msg::Bool>(
         topic("topics.armed", "/px4_interface/out/arm"),
         state_qos,
         [this](std_msgs::msg::Bool::ConstSharedPtr message)
         {
             updateCache(state_.armed, *message, true);
-        });
+        }, subscription_options);
 
-    landed_sub_ = create_subscription<std_msgs::msg::Bool>(
+    landed_sub_ = node_.create_subscription<std_msgs::msg::Bool>(
         topic("topics.landed", "/px4_interface/out/landed"),
         state_qos,
         [this](std_msgs::msg::Bool::ConstSharedPtr message)
         {
             updateCache(state_.landed, *message, true);
-        });
+        }, subscription_options);
 
-    connected_sub_ = create_subscription<std_msgs::msg::Bool>(
+    connected_sub_ = node_.create_subscription<std_msgs::msg::Bool>(
         topic(
             "topics.connected",
             "/px4_interface/out/connected"),
@@ -134,17 +140,18 @@ MotionExecutor::MotionExecutor(const rclcpp::NodeOptions& options)
         [this](std_msgs::msg::Bool::ConstSharedPtr message)
         {
             updateCache(state_.connected, *message, true);
-        });
+        }, subscription_options);
 
-    arm_client_ = create_client<SetArming>(
-        topic("services.arm", "/px4_interface/in/arm"));
+    arm_client_ = node_.create_client<SetArming>(
+        topic("services.arm", "/px4_interface/in/arm"),
+        rmw_qos_profile_services_default, motion_group_);
 
             const auto positive_parameter = [this](
         const std::string& name,
         double default_value)
     {
         const double value =
-            declare_parameter<double>(name, default_value);
+            node_.declare_parameter<double>(name, default_value);
 
         if (!std::isfinite(value) || value <= 0.0) {
             throw std::invalid_argument(
@@ -203,14 +210,26 @@ MotionExecutor::MotionExecutor(const rclcpp::NodeOptions& options)
             "execution.check_frequency is too large");
     }
 
-    execution_timer_ = create_wall_timer(
-        period, [this] { updateExecution(); });
+    execution_timer_ = node_.create_wall_timer(
+        period, [this] { updateExecution(); }, motion_group_);
 
     RCLCPP_INFO(
-        get_logger(),
+        node_.get_logger(),
         "MotionExecutor communication, execution and "
         "real-state observation initialized; "
         "Action servers are not enabled");
+}
+
+void MotionExecutor::stop()
+{
+    execution_timer_->cancel();
+    // Best effort only: no callbacks can confirm a stop once spin has returned.
+    // Never wait for a response from this executor during teardown.
+    if (rclcpp::ok(node_.get_node_base_interface()->get_context())) {
+        const auto execution = getExecutionSnapshot();
+        if (execution.phase != ExecutionPhase::IDLE)
+            requestStop(execution.trajectory_id, StopReason::CLIENT_CANCEL);
+    }
 }
 
 void MotionExecutor::sendTrajectory(
@@ -912,7 +931,7 @@ void MotionExecutor::updateExecution()
     // 不能在持锁期间调用上层模块。
     if (event) {
         RCLCPP_INFO(
-            get_logger(),
+            node_.get_logger(),
             "Trajectory %llu outcome=%d safe_stop=%s: %s",
             static_cast<unsigned long long>(event->trajectory_id),
             static_cast<int>(event->outcome),
@@ -925,13 +944,13 @@ void MotionExecutor::updateExecution()
             }
             catch (const std::exception& error) {
                 RCLCPP_ERROR(
-                    get_logger(),
+                    node_.get_logger(),
                     "Execution callback failed: %s",
                     error.what());
             }
             catch (...) {
                 RCLCPP_ERROR(
-                    get_logger(),
+                    node_.get_logger(),
                     "Execution callback failed with unknown exception");
             }
         }

@@ -1,431 +1,314 @@
-
-#include <cassert>
+#include <atomic>
 #include <chrono>
-#include <iostream>
+#include <future>
 #include <memory>
+#include <stdexcept>
 #include <thread>
-#include <vector>
+#include <type_traits>
 
 #include "drone_node/exec/action_manager.hpp"
+#include "drone_node/exec/exec_node.hpp"
 
 using namespace drone_node::exec;
 using namespace std::chrono_literals;
 
 namespace
 {
-
-VehicleSnapshot grounded(bool armed = false)
+void require(bool value, const char* message)
 {
-    VehicleSnapshot s;
-    s.connected = true;
-    s.armed = armed;
-    s.position_valid = true;
-    s.control_available = true;
-    s.landed_valid = true;
-    s.landed = true;
-    return s;
+    if (!value)
+        throw std::runtime_error(message);
 }
 
-VehicleSnapshot airborne()
+template<typename Predicate>
+void until(Predicate predicate)
 {
-    VehicleSnapshot s;
-    s.connected = true;
-    s.armed = true;
-    s.position_valid = true;
-    s.control_available = true;
-    s.landed_valid = true;
-    s.landed = false;
-    return s;
-}
-
-std::shared_ptr<FlightStateMachine> make_airborne_fsm()
-{
-    auto fsm = std::make_shared<FlightStateMachine>();
-    fsm->update_snapshot(airborne());
-
-    assert(fsm->process_event(
-        FlightEvent::SYNC_AIRBORNE).accepted);
-
-    return fsm;
-}
-
-std::shared_ptr<FlightStateMachine> make_grounded_fsm(
-    bool armed = false)
-{
-    auto fsm = std::make_shared<FlightStateMachine>();
-    fsm->update_snapshot(grounded(armed));
-
-    assert(fsm->process_event(
-        FlightEvent::SYNC_GROUNDED).accepted);
-
-    return fsm;
-}
-
-void expect_state(
-    ActionManager& manager,
-    ActionId id,
-    ActionState expected)
-{
-    const auto record = manager.get(id);
-
-    assert(record.has_value());
-    assert(record->state == expected);
-}
-
-std::size_t count_terminal_events(
-    const std::vector<ActionEvent>& events,
-    ActionId id)
-{
-    std::size_t count = 0;
-
-    for (const auto& event : events) {
-        if (event.id != id) {
-            continue;
-        }
-
-        if (event.kind == ActionEventKind::SUCCEEDED ||
-            event.kind == ActionEventKind::CANCELED ||
-            event.kind == ActionEventKind::FAILED) {
-            ++count;
-        }
-    }
-
-    return count;
-}
-
-void test_admission_and_lifecycle()
-{
-    auto fsm = make_airborne_fsm();
-    ActionManager manager(fsm);
-
-    const auto goal = manager.submit(ActionType::GOTO);
-    assert(goal.accepted);
-
-    const auto rejected = manager.submit(ActionType::LAND);
-    assert(!rejected.accepted);
-
-    expect_state(
-        manager, goal.id, ActionState::PENDING);
-
-    assert(manager.start(goal.id));
-
-    expect_state(
-        manager, goal.id, ActionState::EXECUTING);
-
-    assert(fsm->phase() == FlightPhase::MOVING);
-
-    assert(manager.complete(goal.id));
-
-    expect_state(
-        manager, goal.id, ActionState::SUCCEEDED);
-
-    assert(fsm->phase() == FlightPhase::HOVERING);
-
-    assert(!manager.complete(goal.id));
-    assert(!manager.active_action().has_value());
-
-    const auto events = manager.drain_events();
-
-    assert(count_terminal_events(events, goal.id) == 1);
-
-    std::cout << "[PASS] admission and lifecycle\n";
-}
-
-void test_takeoff_requires_arm()
-{
-    auto fsm = make_grounded_fsm(false);
-    ActionManager manager(fsm);
-
-    assert(!manager.submit(ActionType::TAKEOFF).accepted);
-
-    const auto arm = manager.submit(ActionType::ARM);
-    assert(arm.accepted);
-    assert(manager.start(arm.id));
-
-    // 尚未收到解锁确认，不能成功结束。
-    assert(!manager.complete(arm.id));
-
-    fsm->update_snapshot(grounded(true));
-
-    assert(manager.complete(arm.id));
-
-    const auto takeoff =
-        manager.submit(ActionType::TAKEOFF);
-
-    assert(takeoff.accepted);
-    assert(manager.start(takeoff.id));
-
-    assert(fsm->phase() == FlightPhase::TAKING_OFF);
-
-    fsm->update_snapshot(airborne());
-
-    assert(manager.complete(takeoff.id));
-    assert(fsm->phase() == FlightPhase::HOVERING);
-
-    std::cout << "[PASS] takeoff requires arm\n";
-}
-
-void test_stop_preemption()
-{
-    auto fsm = make_airborne_fsm();
-    ActionManager manager(fsm);
-
-    const auto go = manager.submit(ActionType::GOTO);
-    assert(go.accepted);
-    assert(manager.start(go.id));
-
-    const auto stop = manager.submit(ActionType::STOP);
-    assert(stop.accepted);
-
-    expect_state(
-        manager, go.id, ActionState::CANCELING);
-
-    expect_state(
-        manager, stop.id, ActionState::PENDING);
-
-    assert(manager.active_action().value() == stop.id);
-
-    // 新普通动作不能在抢占期间插入。
-    assert(!manager.submit(ActionType::GOTO).accepted);
-
-    // 不接受重复 Stop。
-    assert(!manager.submit(ActionType::STOP).accepted);
-
-    assert(manager.start(stop.id));
-    assert(fsm->phase() == FlightPhase::STOPPING);
-
-    // 旧 GoTo 的迟到完成事件必须被忽略。
-    assert(!manager.complete(go.id));
-
-    assert(manager.complete(stop.id));
-
-    expect_state(
-        manager, go.id, ActionState::CANCELED);
-
-    expect_state(
-        manager, stop.id, ActionState::SUCCEEDED);
-
-    assert(fsm->phase() == FlightPhase::HOVERING);
-
-    assert(!manager.active_action().has_value());
-
-    const auto events = manager.drain_events();
-
-    assert(count_terminal_events(events, go.id) == 1);
-    assert(count_terminal_events(events, stop.id) == 1);
-
-    std::cout << "[PASS] stop preemption\n";
-}
-
-void test_cancel_waits_for_confirmation()
-{
-    auto fsm = make_airborne_fsm();
-    ActionManager manager(fsm);
-
-    const auto go = manager.submit(ActionType::GOTO);
-    assert(go.accepted);
-    assert(manager.start(go.id));
-
-    assert(manager.cancel(go.id));
-
-    expect_state(
-        manager, go.id, ActionState::CANCELING);
-
-    assert(fsm->phase() == FlightPhase::STOPPING);
-
-    // Cancel 接受后仍然占用动作执行权。
-    assert(manager.active_action().value() == go.id);
-
-    assert(!manager.submit(ActionType::LAND).accepted);
-
-    // 模拟执行器确认已经停止并悬停。
-    assert(manager.complete(go.id));
-
-    expect_state(
-        manager, go.id, ActionState::CANCELED);
-
-    assert(fsm->phase() == FlightPhase::HOVERING);
-
-    std::cout << "[PASS] cancel confirmation\n";
-}
-
-void test_stop_takes_over_cancel()
-{
-    auto fsm = make_airborne_fsm();
-    ActionManager manager(fsm);
-
-    const auto go = manager.submit(ActionType::GOTO);
-    assert(go.accepted);
-    assert(manager.start(go.id));
-
-    assert(manager.cancel(go.id));
-
-    const auto stop = manager.submit(ActionType::STOP);
-    assert(stop.accepted);
-    assert(manager.start(stop.id));
-
-    assert(!manager.complete(go.id));
-
-    assert(manager.complete(stop.id));
-
-    expect_state(
-        manager, go.id, ActionState::CANCELED);
-
-    expect_state(
-        manager, stop.id, ActionState::SUCCEEDED);
-
-    std::cout << "[PASS] stop takes over cancel\n";
-}
-
-void test_stop_cannot_be_canceled()
-{
-    auto fsm = make_airborne_fsm();
-    ActionManager manager(fsm);
-
-    const auto stop = manager.submit(ActionType::STOP);
-    assert(stop.accepted);
-    assert(manager.start(stop.id));
-
-    assert(!manager.cancel(stop.id));
-
-    assert(manager.complete(stop.id));
-
-    expect_state(
-        manager, stop.id, ActionState::SUCCEEDED);
-
-    std::cout << "[PASS] stop cannot be canceled\n";
-}
-
-void test_fault_aborts_actions()
-{
-    auto fsm = make_airborne_fsm();
-    ActionManager manager(fsm);
-
-    const auto go = manager.submit(ActionType::GOTO);
-    assert(go.accepted);
-    assert(manager.start(go.id));
-
-    manager.report_fault("Position estimate lost");
-
-    assert(fsm->phase() == FlightPhase::FAULT);
-
-    expect_state(
-        manager, go.id, ActionState::FAILED);
-
-    assert(!manager.complete(go.id));
-    assert(!manager.submit(ActionType::GOTO).accepted);
-
-    // FAULT 下 Stop 仍可作为紧急请求接受，
-    // 但不改变 FAULT 状态。
-    const auto stop = manager.submit(ActionType::STOP);
-    assert(stop.accepted);
-    assert(manager.start(stop.id));
-
-    assert(fsm->phase() == FlightPhase::FAULT);
-
-    // FAULT 下不能虚报 Stop 已成功悬停。
-    assert(!manager.complete(stop.id));
-
-    manager.report_fault("Stop unavailable");
-
-    expect_state(
-        manager, stop.id, ActionState::FAILED);
-
-    assert(fsm->phase() == FlightPhase::FAULT);
-
-    fsm->update_snapshot(airborne());
-
-    assert(manager.recover_flight_state());
-
-    assert(fsm->phase() == FlightPhase::HOVERING);
-
-    std::cout << "[PASS] fault and recovery\n";
-}
-
-void test_failure_and_timeout()
-{
-    {
-        auto fsm = make_airborne_fsm();
-        ActionManager manager(fsm);
-
-        const auto go = manager.submit(ActionType::GOTO);
-        assert(go.accepted);
-        assert(manager.start(go.id));
-
-        assert(manager.fail(go.id, "Controller fault"));
-
-        expect_state(
-            manager, go.id, ActionState::FAILED);
-
-        assert(fsm->phase() == FlightPhase::FAULT);
-    }
-
-    {
-        auto fsm = make_grounded_fsm(false);
-        ActionManager manager(fsm);
-
-        const auto arm = manager.submit(
-            ActionType::ARM, 1ms);
-
-        assert(arm.accepted);
-        assert(manager.start(arm.id));
-
+    const auto deadline = std::chrono::steady_clock::now() + 8s;
+    while (!predicate()) {
+        require(std::chrono::steady_clock::now() < deadline, "Timed out");
         std::this_thread::sleep_for(5ms);
-        manager.tick();
+    }
+}
 
-        expect_state(
-            manager, arm.id, ActionState::FAILED);
+template<typename Future>
+auto ready(Future future)
+{
+    require(future.wait_for(8s) == std::future_status::ready, "Future timed out");
+    return future.get();
+}
 
-        // Arm 超时不直接推断飞机处于 FAULT。
-        assert(fsm->phase() == FlightPhase::GROUNDED);
+// Only the shared node is added to the executor. The fake vehicle uses the
+// default group; all production callbacks use the two explicit groups.
+struct Fixture
+{
+    using Status = MotionExecutor::ControlStatus;
+    std::shared_ptr<rclcpp::Node> node;
+    rclcpp::CallbackGroup::SharedPtr action_group;
+    rclcpp::CallbackGroup::SharedPtr motion_group;
+    std::shared_ptr<FlightStateMachine> fsm;
+    std::shared_ptr<MotionExecutor> motion;
+    std::shared_ptr<ActionManager> manager;
+    rclcpp::executors::MultiThreadedExecutor executor{rclcpp::ExecutorOptions(), 2};
+    std::thread worker;
+    std::atomic<bool> armed{false}, landed{true}, publish_status{true};
+    std::atomic<std::uint8_t> state{Status::IDLE};
+    std::atomic<std::uint64_t> trajectory{0};
+    std::atomic<unsigned> events{0};
+    rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr position;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr velocity;
+    rclcpp::Publisher<geometry_msgs::msg::QuaternionStamped>::SharedPtr attitude;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr arm, land, connected;
+    rclcpp::Publisher<Status>::SharedPtr status;
+    rclcpp::Subscription<MotionExecutor::ControlTrajectory>::SharedPtr trajectories;
+    rclcpp::Subscription<MotionExecutor::ControlCommand>::SharedPtr commands;
+    rclcpp::TimerBase::SharedPtr telemetry;
+
+    explicit Fixture(bool in_air = false)
+    {
+        armed = in_air;
+        landed = !in_air;
+        state = in_air ? Status::HOVER : Status::IDLE;
+        rclcpp::NodeOptions options;
+        options.parameter_overrides({
+            rclcpp::Parameter("arm.service_wait_timeout", 0.5),
+            rclcpp::Parameter("observation.hover_settle_duration", 0.05),
+            rclcpp::Parameter("goto.settle_duration", 0.05),
+            rclcpp::Parameter("stop.settle_duration", 0.05)});
+        node = std::make_shared<rclcpp::Node>("exec_test", options);
+        action_group = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        motion_group = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        fsm = std::make_shared<FlightStateMachine>();
+        motion = std::make_shared<MotionExecutor>(*node, motion_group);
+        manager = std::make_shared<ActionManager>(*node, action_group, motion, fsm);
+        std::weak_ptr<ActionManager> weak = manager;
+        motion->setExecutionCallback([this, weak](const auto& event) {
+            // Reentering a snapshot accessor verifies notification is outside
+            // execution_mutex_. FSM writes remain in the manager's group.
+            (void)motion->getExecutionSnapshot();
+            ++events;
+            if (auto target = weak.lock())
+                target->enqueueExecutionEvent(event);
+        });
+        const auto qos = rclcpp::QoS(10).reliable();
+        position = node->create_publisher<geometry_msgs::msg::PointStamped>("/px4_interface/out/position", qos);
+        velocity = node->create_publisher<geometry_msgs::msg::Vector3Stamped>("/px4_interface/out/velocity", qos);
+        attitude = node->create_publisher<geometry_msgs::msg::QuaternionStamped>("/px4_interface/out/attitude", qos);
+        arm = node->create_publisher<std_msgs::msg::Bool>("/px4_interface/out/arm", qos);
+        land = node->create_publisher<std_msgs::msg::Bool>("/px4_interface/out/landed", qos);
+        connected = node->create_publisher<std_msgs::msg::Bool>("/px4_interface/out/connected", qos);
+        status = node->create_publisher<Status>("/flight_controller/out/control_status", qos);
+        trajectories = node->create_subscription<MotionExecutor::ControlTrajectory>(
+            "/flight_controller/in/trajectory", qos, [this](MotionExecutor::ControlTrajectory::ConstSharedPtr msg) {
+                trajectory = msg->trajectory_id;
+                state = Status::TRACKING;
+            });
+        commands = node->create_subscription<MotionExecutor::ControlCommand>(
+            "/flight_controller/in/command", qos, [this](MotionExecutor::ControlCommand::ConstSharedPtr) {
+                trajectory = 0;
+                state = Status::HOVER;
+            });
+        telemetry = node->create_wall_timer(10ms, [this] {
+            geometry_msgs::msg::PointStamped p;
+            p.header.frame_id = "map";
+            p.point.z = 1.0;
+            position->publish(p);
+            geometry_msgs::msg::Vector3Stamped v;
+            v.header.frame_id = "map";
+            velocity->publish(v);
+            geometry_msgs::msg::QuaternionStamped q;
+            q.header.frame_id = "map";
+            q.quaternion.w = 1.0;
+            attitude->publish(q);
+            std_msgs::msg::Bool b;
+            b.data = armed.load(); arm->publish(b);
+            b.data = landed.load(); land->publish(b);
+            b.data = true; connected->publish(b);
+            if (publish_status) {
+                Status s;
+                s.stamp = node->now();
+                s.state = state.load();
+                s.trajectory_id = trajectory.load();
+                status->publish(s);
+            }
+        });
+        executor.add_node(node);
+        worker = std::thread([this] { executor.spin(); });
+        try {
+            until([this, in_air] { return fsm->phase() ==
+                (in_air ? FlightPhase::HOVERING : FlightPhase::GROUNDED); });
+        }
+        catch (...) {
+            quiesce();
+            throw;
+        }
     }
 
-    std::cout << "[PASS] failure and timeout\n";
-}
+    void quiesce()
+    {
+        executor.cancel();
+        if (worker.joinable()) worker.join();
+    }
 
-void test_late_events_do_not_affect_new_action()
+    ~Fixture()
+    {
+        quiesce();
+        manager->stop();
+        motion->stop();
+        motion->setExecutionCallback({});
+        manager.reset();
+        motion.reset();
+    }
+
+    template<typename Action>
+    auto client(const char* name)
+    {
+        auto result = rclcpp_action::create_client<Action>(node, name);
+        require(result->wait_for_action_server(5s), "Action server unavailable");
+        return result;
+    }
+
+
+};
+
+void arm_timeout_and_group_progress()
 {
-    auto fsm = make_airborne_fsm();
-    ActionManager manager(fsm);
-
-    const auto first = manager.submit(ActionType::GOTO);
-    assert(first.accepted);
-    assert(manager.start(first.id));
-    assert(manager.complete(first.id));
-
-    const auto second = manager.submit(ActionType::GOTO);
-    assert(second.accepted);
-    assert(manager.start(second.id));
-
-    assert(!manager.complete(first.id));
-    assert(!manager.fail(first.id, "Late failure"));
-
-    expect_state(
-        manager, second.id, ActionState::EXECUTING);
-
-    assert(fsm->phase() == FlightPhase::MOVING);
-
-    assert(manager.complete(second.id));
-
-    std::cout << "[PASS] stale events\n";
+    Fixture f;
+    auto client = f.client<drone_node::action::Arm>("/drone_node/arm");
+    auto goal = ready(client->async_send_goal(drone_node::action::Arm::Goal{}));
+    require(bool(goal), "Arm rejected");
+    auto duplicate = ready(client->async_send_goal(drone_node::action::Arm::Goal{}));
+    require(!duplicate, "Duplicate Arm accepted");
+    const auto before = f.motion->getStateSnapshot().position.received_at;
+    const auto result = ready(client->async_get_result(goal));
+    require(result.code == rclcpp_action::ResultCode::ABORTED, "Missing service must abort Arm");
+    require(result.result->error_code == 2, "Expected service availability timeout");
+    require(f.motion->getStateSnapshot().position.received_at > before, "Group B stalled during Arm");
 }
 
+void fault_and_reset()
+{
+    Fixture f;
+    f.publish_status = false;
+    // Grounded FSM tolerates a stale Ctrl status, but ResetFault must reject it.
+    f.state = Fixture::Status::FAULT;
+    f.publish_status = true;
+    until([&] { return f.fsm->phase() == FlightPhase::FAULT; });
+    auto reset = f.node->create_client<std_srvs::srv::Trigger>("/drone_node/reset_fault");
+    require(reset->wait_for_service(5s), "ResetFault unavailable");
+    auto rejected = ready(reset->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>()));
+    require(!rejected->success, "Reset accepted Ctrl fault");
+    f.state = Fixture::Status::IDLE;
+    until([&] { return !f.motion->getVehicleSnapshot().control_fault; });
+    auto accepted = ready(reset->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>()));
+    require(accepted->success, "Reset rejected fresh grounded state");
+    require(f.fsm->phase() == FlightPhase::GROUNDED, "Reset did not restore GROUNDED");
+}
+
+void motion_cancel_stop_and_completion()
+{
+    Fixture f(true);
+    auto client = f.client<drone_node::action::GoTo>("/drone_node/goto");
+    auto stop_client = f.client<drone_node::action::Stop>("/drone_node/stop");
+    drone_node::action::GoTo::Goal request;
+    request.header.frame_id = "map";
+    request.position.x = 3.0;
+    request.position.z = 1.0;
+    auto terminal_count = std::make_shared<std::atomic<unsigned>>(0);
+    rclcpp_action::Client<drone_node::action::GoTo>::SendGoalOptions options;
+    options.result_callback = [terminal_count](const auto&) { ++*terminal_count; };
+    auto goal = ready(client->async_send_goal(request, options));
+    require(bool(goal), "GoTo rejected");
+    until([&] { return f.motion->getExecutionSnapshot().phase == MotionExecutor::ExecutionPhase::TRACKING; });
+    require(!ready(client->async_send_goal(request)), "Duplicate GoTo accepted");
+    auto canceled = ready(client->async_cancel_goal(goal));
+    require(!canceled->goals_canceling.empty(), "GoTo cancellation rejected");
+    auto stop = ready(stop_client->async_send_goal(drone_node::action::Stop::Goal{}));
+    require(bool(stop), "Stop rejected");
+    require(ready(client->async_get_result(goal)).code == rclcpp_action::ResultCode::CANCELED,
+        "GoTo must finish CANCELED once");
+    require(ready(stop_client->async_get_result(stop)).code == rclcpp_action::ResultCode::SUCCEEDED,
+        "Stop failed");
+    until([&] { return terminal_count->load() == 1; });
+    require(f.events == 1, "Execution terminal event duplicated");
+    require(f.fsm->phase() == FlightPhase::HOVERING, "Stop did not restore HOVERING");
+
+    // Target equals the fake vehicle position: normal completion still needs
+    // TRACKING, fresh HOVER and the original stability window.
+    request.position.x = 0.0;
+    auto completed = ready(client->async_send_goal(request));
+    require(bool(completed), "Second GoTo rejected");
+    require(ready(client->async_get_result(completed)).code == rclcpp_action::ResultCode::SUCCEEDED,
+        "GoTo completion failed");
+    require(f.events == 2 && terminal_count->load() == 1, "Duplicate terminal delivery");
+
+    auto stale = ready(client->async_send_goal(request));
+    require(bool(stale), "Stale-state scenario rejected");
+    f.publish_status = false;
+    require(ready(client->async_get_result(stale)).code == rclcpp_action::ResultCode::ABORTED,
+        "Stale Ctrl status must abort motion");
+    require(f.fsm->phase() == FlightPhase::FAULT, "Stale Ctrl did not latch FAULT");
+}
+
+void group_isolation_and_event_queue()
+{
+    Fixture f(true);
+    auto client = f.client<drone_node::action::GoTo>("/drone_node/goto");
+    drone_node::action::GoTo::Goal request;
+    request.header.frame_id = "map";
+    request.position.x = 3.0;
+    request.position.z = 1.0;
+    require(bool(ready(client->async_send_goal(request))), "GoTo rejected");
+    until([&] { return f.motion->getExecutionSnapshot().phase == MotionExecutor::ExecutionPhase::TRACKING; });
+    std::atomic<bool> entered{false}, finished{false};
+    std::atomic<bool> isolated{false};
+    auto blocker = f.node->create_wall_timer(10ms, [&] {
+        if (entered.exchange(true)) return;
+        const auto before = f.motion->getStateSnapshot().position.received_at;
+        MotionExecutor::ExecutionEvent event;
+        event.trajectory_id = f.trajectory.load() + 100; // stale/unbound event
+        event.outcome = MotionExecutor::ExecutionOutcome::FAILED;
+        f.manager->enqueueExecutionEvent(event);
+        std::this_thread::sleep_for(150ms);
+        isolated = f.motion->getStateSnapshot().position.received_at > before &&
+            f.fsm->phase() == FlightPhase::MOVING;
+        finished = true;
+    }, f.action_group);
+    until([&] { return finished.load(); });
+    require(isolated, "Group B blocked or queued event wrote FSM across groups");
+    blocker->cancel();
+    // After Group A resumes, the unmatched event must still be ignored.
+    std::this_thread::sleep_for(100ms);
+    require(f.fsm->phase() == FlightPhase::MOVING, "Unbound event changed FSM");
+    f.quiesce();
+}
+
+void shutdown_active_goal()
+{
+    Fixture f;
+    auto client = f.client<drone_node::action::Arm>("/drone_node/arm");
+    require(bool(ready(client->async_send_goal(drone_node::action::Arm::Goal{}))), "Arm rejected");
+    // Fixture stops executor workers before releasing the active operation.
+}
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    test_admission_and_lifecycle();
-    test_takeoff_requires_arm();
-    test_stop_preemption();
-    test_cancel_waits_for_confirmation();
-    test_stop_takes_over_cancel();
-    test_stop_cannot_be_canceled();
-    test_fault_aborts_actions();
-    test_failure_and_timeout();
-    test_late_events_do_not_affect_new_action();
-
-    std::cout
-        << "\nAll ActionManager tests passed.\n";
-
-    return 0;
+    static_assert(!std::is_base_of_v<rclcpp::Node, MotionExecutor>);
+    static_assert(!std::is_base_of_v<rclcpp::Node, ActionManager>);
+    rclcpp::init(argc, argv);
+    try {
+        arm_timeout_and_group_progress();
+        fault_and_reset();
+        motion_cancel_stop_and_completion();
+        group_isolation_and_event_queue();
+        shutdown_active_goal();
+        auto node = std::make_shared<ExecNode>();
+        node->shutdown();
+        node->shutdown();
+    }
+    catch (...) {
+        rclcpp::shutdown();
+        throw;
+    }
+    rclcpp::shutdown();
 }

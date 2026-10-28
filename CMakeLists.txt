@@ -213,6 +213,7 @@ target_link_libraries(drone_node_exec
 
 add_executable(motion_executor_exec
   src/main/exec_main.cpp
+  src/exec/exec_node.cpp
   src/exec/motion_executor.cpp
   src/exec/action_manager.cpp
   src/exec/actions/arm.cpp
@@ -275,6 +276,15 @@ if(BUILD_TESTING)
 
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
+
+  get_target_property(exec_sources motion_executor_exec SOURCES)
+  list(REMOVE_ITEM exec_sources src/main/exec_main.cpp)
+  add_executable(test_action_manager test/exec/test_action_manager.cpp ${exec_sources})
+  target_include_directories(test_action_manager PRIVATE ${DRONE_INCLUDE_DIR})
+  ament_target_dependencies(test_action_manager rclcpp rclcpp_action std_msgs std_srvs geometry_msgs)
+  target_link_libraries(test_action_manager Eigen3::Eigen Threads::Threads "${cpp_typesupport_target}")
+  add_test(NAME exec_action_manager COMMAND test_action_manager)
+  set_tests_properties(exec_action_manager PROPERTIES TIMEOUT 60)
 
   ament_lint_auto_find_test_dependencies()
 endif()

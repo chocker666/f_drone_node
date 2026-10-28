@@ -51,7 +51,7 @@ void ActionManager::startMotion()
     const auto now = Clock::now();
 
     const double timeout =
-        motion_executor_->get_parameter(
+        node_.get_parameter(
             "execution.state_timeout").as_double();
 
     if (!freshCache(raw.position, now, timeout) ||
@@ -192,7 +192,7 @@ void ActionManager::startMotion()
     motion_->dispatched_at = Clock::now();
 
     RCLCPP_INFO(
-        get_logger(),
+        node_.get_logger(),
         "%s dispatched: id=%llu "
         "target=(%.3f, %.3f, %.3f) yaw=%.3f",
         motion_->is_continue
@@ -227,7 +227,7 @@ bool ActionManager::motionAtTarget() const
     const auto now = Clock::now();
 
     const double timeout =
-        motion_executor_->get_parameter(
+        node_.get_parameter(
             "execution.state_timeout").as_double();
 
     if (!freshCache(raw.position, now, timeout) ||
@@ -293,7 +293,7 @@ bool ActionManager::landingConfirmed() const
     const auto now = Clock::now();
 
     const double timeout =
-        motion_executor_->get_parameter(
+        node_.get_parameter(
             "execution.state_timeout").as_double();
 
     if (!freshCache(raw.position, now, timeout) ||
@@ -356,7 +356,7 @@ void ActionManager::beginLandDisarm()
             const auto now = Clock::now();
 
             const double timeout =
-                motion_executor_->get_parameter(
+                node_.get_parameter(
                     "execution.state_timeout").as_double();
 
             if (!freshCache(raw.position, now, timeout) ||

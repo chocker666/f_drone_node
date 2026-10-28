@@ -99,7 +99,7 @@ void ActionManager::publishMotionFeedback()
     const auto raw = motion_executor_->getStateSnapshot();
 
     const double timeout =
-        motion_executor_->get_parameter(
+        node_.get_parameter(
             "execution.state_timeout").as_double();
 
     if (!freshCache(raw.position, now, timeout) ||

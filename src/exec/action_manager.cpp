@@ -16,16 +16,18 @@ namespace drone_node::exec
 // ============================================================
 
 ActionManager::ActionManager(
+    rclcpp::Node& node,
+    rclcpp::CallbackGroup::SharedPtr action_group,
     std::shared_ptr<MotionExecutor> motion_executor,
-    std::shared_ptr<FlightStateMachine> flight_state_machine,
-    const rclcpp::NodeOptions& options)
-    : rclcpp::Node("action_manager", options),
+    std::shared_ptr<FlightStateMachine> flight_state_machine)
+    : node_(node),
+      action_group_(std::move(action_group)),
       motion_executor_(std::move(motion_executor)),
       fsm_(std::move(flight_state_machine))
 {
-    if (!motion_executor_ || !fsm_) {
+    if (!action_group_ || !motion_executor_ || !fsm_) {
         throw std::invalid_argument(
-            "ActionManager requires MotionExecutor and FSM");
+            "ActionManager requires action callback group, MotionExecutor and FSM");
     }
 
     const auto positive_parameter = [this](
@@ -33,7 +35,7 @@ ActionManager::ActionManager(
         double default_value)
     {
         const double value =
-            declare_parameter<double>(name, default_value);
+            node_.declare_parameter<double>(name, default_value);
 
         if (!std::isfinite(value) || value <= 0.0) {
             throw std::invalid_argument(
@@ -91,18 +93,18 @@ ActionManager::ActionManager(
     land_confirmation_timeout_ = positive_parameter(
         "land.confirmation_timeout", 2.0);
 
-    land_auto_disarm_ = declare_parameter<bool>(
+    land_auto_disarm_ = node_.declare_parameter<bool>(
         "land.auto_disarm", false);
 
     land_constraints_.require_airborne = false;
     land_constraints_.complete_on_landed = true;
 
     const double executor_stop_timeout =
-        motion_executor_->get_parameter(
+        node_.get_parameter(
             "execution.stop_timeout").as_double();
 
     const double hover_ack_timeout =
-        motion_executor_->get_parameter(
+        node_.get_parameter(
             "execution.hover_ack_timeout").as_double();
 
     const auto validate_constraints = [
@@ -183,22 +185,37 @@ ActionManager::ActionManager(
     hover_server_ = createServer<Hover>("/drone_node/hover");
 
     reset_fault_service_ =
-        create_service<std_srvs::srv::Trigger>(
+        node_.create_service<std_srvs::srv::Trigger>(
             "/drone_node/reset_fault",
             std::bind(
                 &ActionManager::handleResetFault,
                 this,
                 std::placeholders::_1,
-                std::placeholders::_2));
+                std::placeholders::_2),
+            rmw_qos_profile_services_default, action_group_);
 
-    timer_ = create_wall_timer(period, [this] { tick(); });
+    timer_ = node_.create_wall_timer(period, [this] { tick(); }, action_group_);
 
     RCLCPP_INFO(
-        get_logger(),
+        node_.get_logger(),
         "ActionManager initialized: "
         "Arm/Disarm/Takeoff/GoTo/Land/Stop/Continue/Hover enabled; "
         "Land auto_disarm=%s",
         land_auto_disarm_ ? "true" : "false");
+}
+
+void ActionManager::stop()
+{
+    timer_->cancel();
+    arm_server_.reset();
+    disarm_server_.reset();
+    takeoff_server_.reset();
+    goto_server_.reset();
+    land_server_.reset();
+    stop_server_.reset();
+    continue_server_.reset();
+    hover_server_.reset();
+    reset_fault_service_.reset();
 }
 
 ActionManager::~ActionManager()
@@ -220,7 +237,10 @@ typename rclcpp_action::Server<ActionT>::SharedPtr
 ActionManager::createServer(const std::string& name)
 {
     return rclcpp_action::create_server<ActionT>(
-        this,
+        node_.get_node_base_interface(),
+        node_.get_node_clock_interface(),
+        node_.get_node_logging_interface(),
+        node_.get_node_waitables_interface(),
         name,
         [this, name](
             const GoalUUID& uuid,
@@ -263,7 +283,7 @@ ActionManager::createServer(const std::string& name)
             }
             catch (const std::exception& error) {
                 RCLCPP_ERROR(
-                    get_logger(),
+                    node_.get_logger(),
                     "%s goal rejected after exception: %s",
                     name.c_str(),
                     error.what());
@@ -320,7 +340,7 @@ ActionManager::createServer(const std::string& name)
                 std::is_same_v<ActionT, Hover>) {
                 attachMotionGoal<ActionT>(handle);
             }
-        });
+        }, rcl_action_server_get_default_options(), action_group_);
 }
 
 // ============================================================
@@ -335,7 +355,7 @@ rclcpp_action::GoalResponse ActionManager::handleArmGoal(
 
     if (active_ || motion_ || stop_) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "Arm/Disarm rejected: another task is active");
         return rclcpp_action::GoalResponse::REJECT;
     }
@@ -348,7 +368,7 @@ rclcpp_action::GoalResponse ActionManager::handleArmGoal(
 
     if (!admission.accepted) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "%s rejected: %s",
             desired_arm ? "Arm" : "Disarm",
             admission.reason.c_str());
@@ -376,7 +396,7 @@ rclcpp_action::GoalResponse ActionManager::handleTakeoffGoal(
 
     if (!std::isfinite(goal.height) || goal.height < 0.0) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "Takeoff rejected: height must be finite and >= 0");
         return rclcpp_action::GoalResponse::REJECT;
     }
@@ -386,7 +406,7 @@ rclcpp_action::GoalResponse ActionManager::handleTakeoffGoal(
 
     if (!admission.accepted) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "Takeoff rejected: %s",
             admission.reason.c_str());
         return rclcpp_action::GoalResponse::REJECT;
@@ -426,7 +446,7 @@ rclcpp_action::GoalResponse ActionManager::handleGoToGoal(
         !std::isfinite(goal.position.z) ||
         !std::isfinite(goal.yaw)) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "GoTo rejected: requires finite map/ENU position and yaw");
         return rclcpp_action::GoalResponse::REJECT;
     }
@@ -436,7 +456,7 @@ rclcpp_action::GoalResponse ActionManager::handleGoToGoal(
 
     if (!admission.accepted) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "GoTo rejected: %s",
             admission.reason.c_str());
         return rclcpp_action::GoalResponse::REJECT;
@@ -480,7 +500,7 @@ rclcpp_action::GoalResponse ActionManager::handleLandGoal(
     if (!std::isfinite(goal.descent_speed) ||
         goal.descent_speed < 0.0) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "Land rejected: descent_speed must be finite and >= 0");
         return rclcpp_action::GoalResponse::REJECT;
     }
@@ -490,7 +510,7 @@ rclcpp_action::GoalResponse ActionManager::handleLandGoal(
 
     if (!admission.accepted) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "Land rejected: %s",
             admission.reason.c_str());
         return rclcpp_action::GoalResponse::REJECT;
@@ -498,7 +518,7 @@ rclcpp_action::GoalResponse ActionManager::handleLandGoal(
 
     if (goal.descent_speed > 0.0) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "Land descent_speed is ignored: "
             "POINT descent uses the existing controller configuration");
     }
@@ -560,7 +580,7 @@ rclcpp_action::GoalResponse ActionManager::handleContinueGoal(
 
     if (!admission.accepted) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "Continue rejected: %s",
             admission.reason.c_str());
         return rclcpp_action::GoalResponse::REJECT;
@@ -615,7 +635,7 @@ rclcpp_action::GoalResponse ActionManager::handleHoverGoal(
 
     if (!admission.accepted) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "Hover rejected: %s",
             admission.reason.c_str());
         return rclcpp_action::GoalResponse::REJECT;
@@ -652,7 +672,7 @@ rclcpp_action::CancelResponse ActionManager::handleArmCancel(
 
     if (active_->request_sent) {
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "Arm/Disarm cancel rejected: request already sent");
         return rclcpp_action::CancelResponse::REJECT;
     }
@@ -946,7 +966,7 @@ void ActionManager::processExecutionEvents()
             !motion_->trajectory_id ||
             *motion_->trajectory_id != event.trajectory_id) {
             RCLCPP_WARN(
-                get_logger(),
+                node_.get_logger(),
                 "Unbound motion event ignored: trajectory_id=%llu",
                 static_cast<unsigned long long>(
                     event.trajectory_id));
@@ -994,7 +1014,7 @@ void ActionManager::refreshSnapshot()
             paused_.reset();
 
             RCLCPP_WARN(
-                get_logger(),
+                node_.get_logger(),
                 "Paused task invalidated by vehicle observation");
         }
     }
@@ -1005,14 +1025,14 @@ void ActionManager::refreshSnapshot()
         return;
 
     RCLCPP_INFO(
-        get_logger(),
+        node_.get_logger(),
         "Flight phase: %s -> %s",
         to_string(logged_phase_),
         to_string(phase));
 
     if (phase == FlightPhase::FAULT) {
         RCLCPP_ERROR(
-            get_logger(),
+            node_.get_logger(),
             "FSM fault: %s",
             fsm_->fault_reason().c_str());
     }
@@ -1026,7 +1046,7 @@ void ActionManager::latchFault(const std::string& reason)
     fsm_->process_event(FlightEvent::FAULT_DETECTED);
 
     RCLCPP_ERROR(
-        get_logger(),
+        node_.get_logger(),
         "Fault latched: %s",
         reason.c_str());
 }
@@ -1109,7 +1129,7 @@ void ActionManager::handleResetFault(
             "FSM recovery rejected: " + result.reason;
 
         RCLCPP_WARN(
-            get_logger(),
+            node_.get_logger(),
             "%s",
             response->message.c_str());
 
@@ -1126,7 +1146,7 @@ void ActionManager::handleResetFault(
         "Exec FAULT cleared; flight phase is GROUNDED";
 
     RCLCPP_INFO(
-        get_logger(),
+        node_.get_logger(),
         "Manual FAULT reset succeeded: %s -> %s",
         to_string(result.previous),
         to_string(result.current));
@@ -1177,7 +1197,7 @@ void ActionManager::finishActive(
     }
 
     RCLCPP_INFO(
-        get_logger(),
+        node_.get_logger(),
         "Arm terminal state=%d error=%u: %s",
         static_cast<int>(state),
         static_cast<unsigned>(error),
@@ -1207,7 +1227,7 @@ void ActionManager::finishMotion(
     }
 
     RCLCPP_INFO(
-        get_logger(),
+        node_.get_logger(),
         "Motion terminal state=%d error=%u: %s",
         static_cast<int>(state),
         static_cast<unsigned>(error),
@@ -1239,7 +1259,7 @@ void ActionManager::finishStop(
     }
 
     RCLCPP_INFO(
-        get_logger(),
+        node_.get_logger(),
         "Stop terminal state=%d error=%u paused=%s: %s",
         static_cast<int>(state),
         static_cast<unsigned>(error),
@@ -1399,7 +1419,7 @@ void ActionManager::tick()
         }
         else {
             RCLCPP_ERROR(
-                get_logger(),
+                node_.get_logger(),
                 "ActionManager tick failed: %s",
                 error.what());
         }
@@ -1481,7 +1501,7 @@ ActionManager::capturePausedTask() const
         const auto now = Clock::now();
 
         const double timeout =
-            motion_executor_->get_parameter(
+            node_.get_parameter(
                 "execution.state_timeout").as_double();
 
         if (!freshCache(raw.position, now, timeout) ||

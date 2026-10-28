@@ -30,18 +30,22 @@
 namespace drone_node::exec
 {
 
-class ActionManager : public rclcpp::Node
+class ActionManager
 {
 public:
     explicit ActionManager(
+        rclcpp::Node& node,
+        rclcpp::CallbackGroup::SharedPtr action_group,
         std::shared_ptr<MotionExecutor> motion_executor,
-        std::shared_ptr<FlightStateMachine> flight_state_machine,
-        const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
+        std::shared_ptr<FlightStateMachine> flight_state_machine);
 
-    ~ActionManager() override;
+    ~ActionManager();
 
-    // 跨节点回调只入队。
-    // GoalHandle 和任务状态由本节点默认互斥回调组处理。
+    // Executor workers must be stopped before calling. Idempotent.
+    void stop();
+
+    // 跨回调组事件只入队。
+    // GoalHandle、任务状态及 FSM 由 action_group_ 串行处理。
     void enqueueExecutionEvent(
         const MotionExecutor::ExecutionEvent& event);
 
@@ -346,6 +350,8 @@ private:
     // map 坐标系绝对高度，非相对当前位置下降 1 米。
     static constexpr double LAND_TARGET_Z = -0.1;
 
+    rclcpp::Node& node_;
+    rclcpp::CallbackGroup::SharedPtr action_group_;
     std::shared_ptr<MotionExecutor> motion_executor_;
     std::shared_ptr<FlightStateMachine> fsm_;
 

@@ -110,7 +110,7 @@ void ActionManager::tickArm()
         active_->phase = ArmPhase::WAIT_RESPONSE;
 
         RCLCPP_INFO(
-            get_logger(),
+            node_.get_logger(),
             "SetArming dispatched: arm=%s request_id=%lld",
             active_->desired_arm ? "true" : "false",
             static_cast<long long>(
