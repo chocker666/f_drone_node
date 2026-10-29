@@ -2,12 +2,6 @@
 # DiscreteTraj.msg
 # Non-uniform time-parameterized discrete trajectory.
 
-# Unique trajectory identifier.
-uint64 trajectory_id
-
-# Reference frame, e.g. odom_ned.
-string frame_id
-
 # Relative time [s], N >= 2.
 # Must start at 0, be finite and strictly increasing.
 float64[] time_from_start

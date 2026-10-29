@@ -6,12 +6,6 @@
 # All polynomial coefficients must be finite.
 # Units: SI (m, s, rad).
 
-# Unique trajectory identifier.
-uint64 trajectory_id
-
-# Reference coordinate frame, e.g. odom_ned.
-string frame_id
-
 # Number of polynomial segments, must be >= 1.
 uint32 segment_count
 
