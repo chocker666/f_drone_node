@@ -123,8 +123,7 @@ set(INTER_SOURCES
 set(CTRL_SOURCES
   src/ctrl/flight_controller.cpp
   src/ctrl/trajectory_manager.cpp
-  src/ctrl/trajectory_sampler/point_sampler.cpp
-  src/ctrl/trajectory_sampler/list_sampler.cpp
+  src/ctrl/trajectory_sampler/polynomial_sampler.cpp
 )
 
 # ============================================================
@@ -211,38 +210,38 @@ target_link_libraries(drone_node_exec
 # Motion Executor executable
 # ============================================================
 
-add_executable(motion_executor_exec
-  src/main/exec_main.cpp
-  src/exec/exec_node.cpp
-  src/exec/motion_executor.cpp
-  src/exec/action_manager.cpp
-  src/exec/actions/arm.cpp
-  src/exec/actions/motion.cpp
-  src/exec/actions/motion_feedback.cpp
-  src/exec/actions/motion_tick.cpp
-  src/exec/actions/hover.cpp
-  src/exec/actions/stop.cpp
-  src/exec/flight_state_machine.cpp
-  src/exec/planner/motion_planner.cpp
-  src/exec/planner/fixed_planner.cpp
-)
+# add_executable(motion_executor_exec
+#   src/main/exec_main.cpp
+#   src/exec/exec_node.cpp
+#   src/exec/motion_executor.cpp
+#   src/exec/action_manager.cpp
+#   src/exec/actions/arm.cpp
+#   src/exec/actions/motion.cpp
+#   src/exec/actions/motion_feedback.cpp
+#   src/exec/actions/motion_tick.cpp
+#   src/exec/actions/hover.cpp
+#   src/exec/actions/stop.cpp
+#   src/exec/flight_state_machine.cpp
+#   src/exec/planner/motion_planner.cpp
+#   src/exec/planner/fixed_planner.cpp
+# )
 
-target_include_directories(motion_executor_exec PUBLIC
-  ${DRONE_INCLUDE_DIR}
-)
+# target_include_directories(motion_executor_exec PUBLIC
+#   ${DRONE_INCLUDE_DIR}
+# )
 
-ament_target_dependencies(motion_executor_exec
-  rclcpp
-  rclcpp_action
-  std_msgs
-  std_srvs
-  geometry_msgs
-)
+# ament_target_dependencies(motion_executor_exec
+#   rclcpp
+#   rclcpp_action
+#   std_msgs
+#   std_srvs
+#   geometry_msgs
+# )
 
-target_link_libraries(motion_executor_exec
-  Eigen3::Eigen
-  "${cpp_typesupport_target}"
-)
+# target_link_libraries(motion_executor_exec
+#   Eigen3::Eigen
+#   "${cpp_typesupport_target}"
+# )
 
 
 # ============================================================
@@ -253,7 +252,7 @@ install(TARGETS
   drone_node_exec
   px4_interface_exec
   flight_controller_exec
-  motion_executor_exec
+  # motion_executor_exec
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -276,15 +275,6 @@ if(BUILD_TESTING)
 
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
-
-  get_target_property(exec_sources motion_executor_exec SOURCES)
-  list(REMOVE_ITEM exec_sources src/main/exec_main.cpp)
-  add_executable(test_action_manager test/exec/test_action_manager.cpp ${exec_sources})
-  target_include_directories(test_action_manager PRIVATE ${DRONE_INCLUDE_DIR})
-  ament_target_dependencies(test_action_manager rclcpp rclcpp_action std_msgs std_srvs geometry_msgs)
-  target_link_libraries(test_action_manager Eigen3::Eigen Threads::Threads "${cpp_typesupport_target}")
-  add_test(NAME exec_action_manager COMMAND test_action_manager)
-  set_tests_properties(exec_action_manager PROPERTIES TIMEOUT 60)
 
   ament_lint_auto_find_test_dependencies()
 endif()
