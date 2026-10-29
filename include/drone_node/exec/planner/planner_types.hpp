@@ -3,14 +3,15 @@
 #include <cstdint>
 #include <string>
 
-#include <Eigen/Core>
+#include "drone_node/msg/control_trajectory.hpp"
+#include "drone_node/exec/planner/quintic_planner.hpp"
 
 namespace drone_node::exec
 {
 
 enum class PlannerType : std::uint8_t
 {
-    FIXED = 0,
+    QUINTIC = 0,
     EXTERNAL = 1
 };
 
@@ -22,44 +23,33 @@ enum class PlanningStatus : std::uint8_t
     FAILED
 };
 
-// 规划层的轨迹类型，不依赖 ROS2 消息。
-enum class PlannedMotionType : std::uint8_t
-{
-    POINT = 0
-};
-
 struct PlanningRequest
 {
-    PlannerType planner_type{PlannerType::FIXED};
+    using BoundaryState =
+        planner::QuinticPlanner::BoundaryState;
 
-    // 固定目标使用 map/ENU 坐标。
+    using Limits =
+        planner::QuinticPlanner::Limits;
+
+    using YawDirection =
+        planner::QuinticPlanner::YawDirection;
+
+    PlannerType planner_type{PlannerType::QUINTIC};
+
+    BoundaryState start;
+    BoundaryState goal;
+
+    double duration{0.0};
+
+    YawDirection yaw_direction{
+        YawDirection::SHORTEST
+    };
+
+    Limits limits;
+
+    std::uint64_t trajectory_id{0};
+
     std::string frame_id{"map"};
-
-    Eigen::Vector3d target_position{
-        Eigen::Vector3d::Zero()};
-
-    double target_yaw{0.0};
-
-    // 与现有 FixedTrajectory 语义一致：
-    // 0 = SHORTEST，1 = CW，2 = CCW。
-    std::uint8_t yaw_direction{0};
-
-    std::string controller_id{"position_yaw_pid"};
-    std::string config_name{"default"};
-};
-
-struct PlannedMotion
-{
-    PlannerType planner_type{PlannerType::FIXED};
-    PlannedMotionType motion_type{PlannedMotionType::POINT};
-
-    std::string frame_id{"map"};
-
-    Eigen::Vector3d target_position{
-        Eigen::Vector3d::Zero()};
-
-    double target_yaw{0.0};
-    std::uint8_t yaw_direction{0};
 
     std::string controller_id{"position_yaw_pid"};
     std::string config_name{"default"};
@@ -68,8 +58,10 @@ struct PlannedMotion
 struct PlanningResult
 {
     PlanningStatus status{PlanningStatus::FAILED};
+
     std::string reason;
-    PlannedMotion motion;
+
+    drone_node::msg::ControlTrajectory trajectory;
 
     bool success() const noexcept
     {
