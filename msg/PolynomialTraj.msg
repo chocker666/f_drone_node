@@ -1,6 +1,10 @@
 
 # PolynomialTraj.msg
-# Time-parameterized piecewise polynomial trajectory.
+# Piecewise polynomial trajectory.
+#
+# All trajectory times are relative to activation.
+# All polynomial coefficients must be finite.
+# Units: SI (m, s, rad).
 
 # Unique trajectory identifier.
 uint64 trajectory_id
@@ -8,50 +12,45 @@ uint64 trajectory_id
 # Reference coordinate frame, e.g. odom_ned.
 string frame_id
 
-# Scheduled activation time in ROS time.
-# Zero means activation at the next eligible control-cycle boundary.
-builtin_interfaces/Time start_time
-
 # Number of polynomial segments, must be >= 1.
 uint32 segment_count
 
 # Duration of each segment [s].
 # Length = segment_count.
-# All durations must be finite and strictly positive.
+# All values must be finite and > 0.
 float64[] segment_duration
 
 # Polynomial degrees.
-# Position axes share position_degree.
-# Yaw uses yaw_degree independently.
+# X/Y/Z share the same position_degree.
+# Yaw uses an independent yaw_degree.
 uint32 position_degree
 uint32 yaw_degree
 
 # Flattened polynomial coefficients.
-# Segment-major order, ascending powers of local time.
 #
-# Position coefficient array length:
-# segment_count * (position_degree + 1)
+# Coefficients are stored in segment-major order,
+# with ascending powers of local segment time.
 #
-# Yaw coefficient array length:
-# segment_count * (yaw_degree + 1)
+# For segment i:
+# p_i(t) = c0 + c1*t + ... + cn*t^n
+# where t is local time in [0, segment_duration[i]].
 #
-# For segment i, position coefficients start at:
-# i * (position_degree + 1)
+# Position array length:
+#   segment_count * (position_degree + 1)
 #
-# For segment i, yaw coefficients start at:
-# i * (yaw_degree + 1)
+# Yaw array length:
+#   segment_count * (yaw_degree + 1)
 #
 # All coefficients must be finite.
 
-# X position polynomial coefficients [m, m/s, ...].
+# X position coefficients.
 float64[] coeff_x
 
-# Y position polynomial coefficients.
+# Y position coefficients.
 float64[] coeff_y
 
-# Z position polynomial coefficients.
+# Z position coefficients.
 float64[] coeff_z
 
-# Yaw polynomial coefficients [rad, rad/s, ...].
-# Yaw is represented as a continuous unwrapped angle.
+# Unwrapped yaw coefficients [rad].
 float64[] coeff_yaw
