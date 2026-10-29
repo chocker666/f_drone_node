@@ -68,59 +68,98 @@ void ActionManager::startMotion()
     }
 
     const auto& position = raw.position.message.point;
+    const auto& velocity = raw.velocity.message.vector;
+
     PlanningRequest request = motion_->request;
+
+    // 规划起点：使用当前飞机反馈。
+    // 当前状态消息没有提供加速度，因此起点加速度暂设为零。
+    request.start.position = Eigen::Vector3d(
+        position.x, position.y, position.z);
+
+    request.start.velocity = Eigen::Vector3d(
+        velocity.x, velocity.y, velocity.z);
+
+    request.start.acceleration = Eigen::Vector3d::Zero();
+    request.start.yaw = measuredYaw(raw.attitude.message);
+    request.start.yaw_rate = 0.0;
+    request.start.yaw_acceleration = 0.0;
+
+    // 当前只实现五次多项式规划。
+    request.planner_type = PlannerType::QUINTIC;
+
+    // 默认终点静止。
+    request.goal.velocity = Eigen::Vector3d::Zero();
+    request.goal.acceleration = Eigen::Vector3d::Zero();
+    request.goal.yaw_rate = 0.0;
+    request.goal.yaw_acceleration = 0.0;
 
     if (motion_->type == ActionType::TAKEOFF &&
         !motion_->resumed_target) {
-        request.planner_type = PlannerType::FIXED;
+
         request.frame_id = "map";
 
-        request.target_position = Eigen::Vector3d(
+        request.goal.position = Eigen::Vector3d(
             position.x,
             position.y,
             position.z + motion_->height);
 
-        request.target_yaw = measuredYaw(raw.attitude.message);
-        request.yaw_direction = 0;
+        request.goal.yaw = request.start.yaw;
+        request.yaw_direction =
+            PlanningRequest::YawDirection::SHORTEST;
+
         request.controller_id = "position_yaw_pid";
         request.config_name = "default";
     }
     else if (motion_->type == ActionType::LAND &&
-             !motion_->resumed_target) {
+            !motion_->resumed_target) {
+
         if (position.z <= LAND_TARGET_Z) {
             finishMotion(
                 ActionState::FAILED,
                 ErrorCode::STATE_REJECTED,
-                "Land requires current map z above -1.0");
+                "Land requires current z above landing target");
             return;
         }
 
-        request.planner_type = PlannerType::FIXED;
         request.frame_id = "map";
 
-        request.target_position = Eigen::Vector3d(
+        request.goal.position = Eigen::Vector3d(
             position.x,
             position.y,
             LAND_TARGET_Z);
 
-        request.target_yaw = measuredYaw(raw.attitude.message);
-        request.yaw_direction = 0;
+        request.goal.yaw = request.start.yaw;
+        request.yaw_direction =
+            PlanningRequest::YawDirection::SHORTEST;
+
         request.controller_id = "position_yaw_pid";
         request.config_name = "default";
     }
-    else if (motion_->is_hover && !motion_->resumed_target) {
-        request.planner_type = PlannerType::FIXED;
+    else if (motion_->is_hover &&
+            !motion_->resumed_target) {
+
         request.frame_id = "map";
 
-        request.target_position = Eigen::Vector3d(
-            position.x,
-            position.y,
-            position.z);
+        request.goal.position = request.start.position;
+        request.goal.yaw = request.start.yaw;
 
-        request.target_yaw = measuredYaw(raw.attitude.message);
-        request.yaw_direction = 0;
+        request.yaw_direction =
+            PlanningRequest::YawDirection::SHORTEST;
+
         request.controller_id = "position_yaw_pid";
         request.config_name = "default";
+    }
+
+    // 必须保证规划时间有效。
+    // 不在这里随意设置默认时长，以免掩盖上层配置错误。
+    if (!std::isfinite(request.duration) ||
+        request.duration <= 0.0) {
+        finishMotion(
+            ActionState::FAILED,
+            ErrorCode::STATE_REJECTED,
+            "Motion duration must be finite and positive");
+        return;
     }
 
     const auto planning = planner_.plan(request);
@@ -133,10 +172,8 @@ void ActionManager::startMotion()
         return;
     }
 
-    const double initial_distance = std::hypot(
-        request.target_position.x() - position.x,
-        request.target_position.y() - position.y,
-        request.target_position.z() - position.z);
+    const double initial_distance =
+        (request.goal.position - request.start.position).norm();
 
     if (!std::isfinite(initial_distance)) {
         finishMotion(
@@ -150,7 +187,13 @@ void ActionManager::startMotion()
         motion_->start_z = position.z;
 
     motion_->initial_distance = initial_distance;
-    motion_->motion = planning.motion;
+
+    // 保存本次实际规划请求，供后续目标检查和反馈使用。
+    motion_->request = request;
+
+    // 保存新生成的 ControlTrajectory。
+    motion_->motion = planning.trajectory;
+
 
     const auto start_event =
         motion_->type == ActionType::TAKEOFF
@@ -199,10 +242,10 @@ void ActionManager::startMotion()
             ? "Continue"
             : to_string(motion_->source_type),
         static_cast<unsigned long long>(*id),
-        request.target_position.x(),
-        request.target_position.y(),
-        request.target_position.z(),
-        request.target_yaw);
+        request.goal.position.x(),
+        request.goal.position.y(),
+        request.goal.position.z(),
+        request.goal.yaw);
 }
 
 bool ActionManager::motionAtTarget() const
@@ -241,7 +284,7 @@ bool ActionManager::motionAtTarget() const
 
     const auto& p = raw.position.message.point;
     const auto& v = raw.velocity.message.vector;
-    const auto& target = motion_->motion.target_position;
+    const auto& target = motion_->request.goal.position;
 
     const double position_error = std::hypot(
         p.x - target.x(),
@@ -251,8 +294,7 @@ bool ActionManager::motionAtTarget() const
     const double speed = std::hypot(v.x, v.y, v.z);
 
     const double delta =
-        measuredYaw(raw.attitude.message) -
-        motion_->motion.target_yaw;
+        measuredYaw(raw.attitude.message) - motion_->request.goal.yaw;
 
     const double yaw_error =
         std::abs(std::atan2(std::sin(delta), std::cos(delta)));
@@ -307,7 +349,7 @@ bool ActionManager::landingConfirmed() const
 
     const auto& p = raw.position.message.point;
     const auto& v = raw.velocity.message.vector;
-    const auto& target = motion_->motion.target_position;
+    const auto& target = motion_->request.goal.position;
 
     // -1.0 是触发下降的参考点，不要求飞机实际到达地下高度。
     const double horizontal_error =
@@ -316,8 +358,7 @@ bool ActionManager::landingConfirmed() const
     const double speed = std::hypot(v.x, v.y, v.z);
 
     const double delta =
-        measuredYaw(raw.attitude.message) -
-        motion_->motion.target_yaw;
+        measuredYaw(raw.attitude.message) - motion_->request.goal.yaw;
 
     const double yaw_error =
         std::abs(std::atan2(std::sin(delta), std::cos(delta)));
@@ -368,7 +409,7 @@ void ActionManager::beginLandDisarm()
             double value = p.z;
 
             if (motion_->is_continue) {
-                const auto& target = motion_->motion.target_position;
+                const auto& target = motion_->request.goal.position;
                 value = std::hypot(
                     p.x - target.x(),
                     p.y - target.y(),

@@ -138,7 +138,7 @@ private:
         double start_z{0.0};
 
         PlanningRequest request;
-        PlannedMotion motion;
+        drone_node::msg::ControlTrajectory motion;
 
         MotionExecutor::ExecutionConstraints constraints;
         double confirmation_timeout{2.0};
