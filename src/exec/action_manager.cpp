@@ -470,16 +470,28 @@ rclcpp_action::GoalResponse ActionManager::handleGoToGoal(
     operation.confirmation_timeout =
         goto_confirmation_timeout_;
 
-    operation.request.planner_type = PlannerType::FIXED;
+
+    operation.request.planner_type = PlannerType::QUINTIC;
     operation.request.frame_id = "map";
-    operation.request.target_position = Eigen::Vector3d(
+
+    operation.request.goal.position = Eigen::Vector3d(
         goal.position.x,
         goal.position.y,
         goal.position.z);
-    operation.request.target_yaw = goal.yaw;
-    operation.request.yaw_direction = 0;
+
+    operation.request.goal.yaw = goal.yaw;
+
+    operation.request.goal.velocity = Eigen::Vector3d::Zero();
+    operation.request.goal.acceleration = Eigen::Vector3d::Zero();
+    operation.request.goal.yaw_rate = 0.0;
+    operation.request.goal.yaw_acceleration = 0.0;
+
+    operation.request.yaw_direction =
+        PlanningRequest::YawDirection::SHORTEST;
+
     operation.request.controller_id = "position_yaw_pid";
     operation.request.config_name = "default";
+
 
     motion_.emplace(std::move(operation));
     paused_.reset();
@@ -1430,6 +1442,7 @@ void ActionManager::tick()
 // Pause capture
 // ============================================================
 
+
 std::optional<ActionManager::PausedTask>
 ActionManager::capturePausedTask() const
 {
@@ -1437,6 +1450,7 @@ ActionManager::capturePausedTask() const
         return std::nullopt;
 
     PausedTask saved;
+
     saved.source_type = motion_->source_type;
     saved.constraints = motion_->constraints;
     saved.confirmation_timeout =
@@ -1454,6 +1468,16 @@ ActionManager::capturePausedTask() const
     saved.hover_remaining =
         motion_->hover_duration;
 
+    // 保存规划请求，而不是保存已生成的多项式轨迹。
+    //
+    // PlanningRequest 保留绝对目标、Yaw 方向、
+    // 控制器配置和规划约束。
+    //
+    // Continue 时 startMotion() 会根据最新反馈
+    // 重新设置起点并生成新的 ControlTrajectory。
+    saved.request = motion_->request;
+    saved.request.planner_type = PlannerType::QUINTIC;
+
     if (motion_->holding) {
         const double elapsed =
             elapsedSince(motion_->hold_started_at);
@@ -1463,7 +1487,9 @@ ActionManager::capturePausedTask() const
 
         saved.hover_elapsed += counted;
         saved.hover_remaining =
-            std::max(0.0, motion_->hover_duration - counted);
+            std::max(
+                0.0,
+                motion_->hover_duration - counted);
     }
     else if (motion_->trajectory_id && stop_) {
         const double spent = std::max(
@@ -1480,65 +1506,71 @@ ActionManager::capturePausedTask() const
         }
     }
 
-    if (motion_->trajectory_id) {
-        saved.request.planner_type = PlannerType::FIXED;
-        saved.request.frame_id = motion_->motion.frame_id;
-        saved.request.target_position =
-            motion_->motion.target_position;
-        saved.request.target_yaw =
-            motion_->motion.target_yaw;
-        saved.request.yaw_direction =
-            motion_->motion.yaw_direction;
-        saved.request.controller_id =
-            motion_->motion.controller_id;
-        saved.request.config_name =
-            motion_->motion.config_name;
+    // 已经发送轨迹的任务，其 motion_->request
+    // 在 startMotion() 中保存了实际规划目标。
+    //
+    // 不再从 motion_->motion（ControlTrajectory）
+    // 读取 target_position、target_yaw 或 yaw_direction。
+    if (motion_->trajectory_id)
+        return saved;
+
+    // 尚未发送轨迹的任务：
+    // 对 TAKEOFF、LAND、HOVER 计算并冻结绝对目标。
+    const auto raw = motion_executor_->getStateSnapshot();
+    const auto now = Clock::now();
+
+    const double timeout =
+        node_.get_parameter(
+            "execution.state_timeout").as_double();
+
+    if (!freshCache(raw.position, now, timeout) ||
+        !freshCache(raw.attitude, now, timeout) ||
+        raw.position.message.header.frame_id != "map" ||
+        raw.attitude.message.header.frame_id != "map") {
+        return std::nullopt;
     }
-    else {
-        saved.request = motion_->request;
 
-        const auto raw = motion_executor_->getStateSnapshot();
-        const auto now = Clock::now();
+    const auto& p = raw.position.message.point;
 
-        const double timeout =
-            node_.get_parameter(
-                "execution.state_timeout").as_double();
+    if (motion_->type == ActionType::TAKEOFF &&
+        !motion_->resumed_target) {
 
-        if (!freshCache(raw.position, now, timeout) ||
-            !freshCache(raw.attitude, now, timeout) ||
-            raw.position.message.header.frame_id != "map" ||
-            raw.attitude.message.header.frame_id != "map") {
+        saved.start_z = p.z;
+
+        saved.request.goal.position = Eigen::Vector3d(
+            p.x,
+            p.y,
+            p.z + motion_->height);
+
+        saved.request.goal.yaw =
+            measuredYaw(raw.attitude.message);
+    }
+    else if (motion_->type == ActionType::LAND &&
+             !motion_->resumed_target) {
+
+        if (p.z <= LAND_TARGET_Z)
             return std::nullopt;
-        }
 
-        const auto& p = raw.position.message.point;
+        saved.start_z = p.z;
 
-        if (motion_->type == ActionType::TAKEOFF &&
-            !motion_->resumed_target) {
-            saved.start_z = p.z;
-            saved.request.target_position = Eigen::Vector3d(
-                p.x, p.y, p.z + motion_->height);
-            saved.request.target_yaw =
-                measuredYaw(raw.attitude.message);
-        }
-        else if (motion_->type == ActionType::LAND &&
-                 !motion_->resumed_target) {
-            if (p.z <= LAND_TARGET_Z)
-                return std::nullopt;
+        saved.request.goal.position = Eigen::Vector3d(
+            p.x,
+            p.y,
+            LAND_TARGET_Z);
 
-            saved.start_z = p.z;
-            saved.request.target_position = Eigen::Vector3d(
-                p.x, p.y, LAND_TARGET_Z);
-            saved.request.target_yaw =
-                measuredYaw(raw.attitude.message);
-        }
-        else if (motion_->is_hover &&
-                 !motion_->resumed_target) {
-            saved.request.target_position = Eigen::Vector3d(
-                p.x, p.y, p.z);
-            saved.request.target_yaw =
-                measuredYaw(raw.attitude.message);
-        }
+        saved.request.goal.yaw =
+            measuredYaw(raw.attitude.message);
+    }
+    else if (motion_->is_hover &&
+             !motion_->resumed_target) {
+
+        saved.request.goal.position = Eigen::Vector3d(
+            p.x,
+            p.y,
+            p.z);
+
+        saved.request.goal.yaw =
+            measuredYaw(raw.attitude.message);
     }
 
     return saved;

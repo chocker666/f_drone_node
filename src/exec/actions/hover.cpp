@@ -61,7 +61,7 @@ void ActionManager::tickHoverHold()
     if (motion_->is_continue) {
         const auto raw = motion_executor_->getStateSnapshot();
         const auto& p = raw.position.message.point;
-        const auto& target = motion_->motion.target_position;
+        const auto& target = motion_->request.goal.position;
 
         value = std::hypot(
             p.x - target.x(),

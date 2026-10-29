@@ -64,7 +64,7 @@ double ActionManager::motionProgress() const
             1.0);
     }
 
-    const auto& target = motion_->motion.target_position;
+    const auto& target = motion_->request.goal.position;
 
     const double remaining = std::hypot(
         p.x - target.x(),
@@ -146,7 +146,7 @@ void ActionManager::publishMotionFeedback()
         value = p.z - motion_->start_z;
     }
     else {
-        const auto& target = motion_->motion.target_position;
+        const auto& target = motion_->request.goal.position;
 
         value = std::hypot(
             p.x - target.x(),
