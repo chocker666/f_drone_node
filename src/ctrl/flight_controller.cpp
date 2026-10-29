@@ -164,11 +164,20 @@ FlightController::FlightController(
             &FlightController::attitude_callback,
             this, std::placeholders::_1));
 
-    trajectory_sub_ = create_subscription<ControlTrajectory>(
-        "/flight_controller/in/trajectory",
+    discrete_trajectory_sub_ =
+        create_subscription<DiscreteTraj>(
+        "/flight_controller/in/discrete_trajectory",
         rclcpp::QoS(1).reliable(),
         std::bind(
-            &FlightController::trajectory_callback,
+            &FlightController::discrete_trajectory_callback,
+            this, std::placeholders::_1));
+
+    polynomial_trajectory_sub_ =
+        create_subscription<PolynomialTraj>(
+        "/flight_controller/in/polynomial_trajectory",
+        rclcpp::QoS(1).reliable(),
+        std::bind(
+            &FlightController::polynomial_trajectory_callback,
             this, std::placeholders::_1));
 
     command_sub_ = create_subscription<ControlCommand>(
@@ -392,98 +401,85 @@ void FlightController::command_callback(
     }
 }
 
-void FlightController::trajectory_callback(
-    const ControlTrajectory::SharedPtr msg)
+void FlightController::discrete_trajectory_callback(
+    const DiscreteTraj::SharedPtr msg)
 {
     if (control_state_ == ControlStatus::FAULT) {
         RCLCPP_WARN(
             get_logger(),
-            "Trajectory rejected: controller in FAULT");
+            "Discrete trajectory %lu rejected: controller in FAULT",
+            static_cast<unsigned long>(msg->trajectory_id));
         return;
     }
-
-    if (msg->controller_id != "position_yaw_pid") {
-        RCLCPP_WARN(
-            get_logger(),
-            "Trajectory rejected: unknown controller");
-        return;
-    }
-
-    const auto selected = controller_configs_.find(msg->config_name);
-
-    if (selected == controller_configs_.end()) {
-        RCLCPP_WARN(
-            get_logger(),
-            "Trajectory rejected: unknown configuration '%s'",
-            msg->config_name.c_str());
-        return;
-    }
-
-    const auto pending_config = selected->second;
 
     try {
-        drone_node::TrajectoryManager pending_trajectory;
-        const drone_node::SteadyTime preparation_origin{};
-
         std::string reason;
-        const auto accepted = pending_trajectory.accept(
-            *msg, preparation_origin, reason);
+        const auto result = trajectory_manager_.prepare(
+            *msg, reason);
 
-        if (accepted ==
-            drone_node::TrajectoryManager::AcceptResult::REJECTED) {
-            RCLCPP_WARN(
-                get_logger(),
-                "Trajectory %lu rejected: %s",
-                static_cast<unsigned long>(msg->trajectory_id),
-                reason.c_str());
-            return;
-        }
-
-        const auto state = state_cache_->snapshot(SteadyClock::now());
-
-        if (!drone_node::StateCache::usable(state)) {
-            RCLCPP_WARN(
-                get_logger(),
-                "Trajectory rejected: no fresh vehicle state");
-            return;
-        }
-
-        auto pending_controller =
-            drone_node::controller::ControllerFactory::create(
-                msg->controller_id, pending_config);
-
-        pending_controller->initialize(
-            make_input(
-                state,
-                pending_trajectory.sample(preparation_origin),
-                1.0 / active_control_frequency_),
-            static_cast<drone_node::controller::YawDirection>(
-                pending_trajectory.yaw_direction()));
-
-        pending_trajectory.activate(SteadyClock::now());
-
-        clear_execution();
-
-        trajectory_manager_ = std::move(pending_trajectory);
-        controller_ = std::move(pending_controller);
-        controller_config_ = pending_config;
-
-        fault_code_ = ControlStatus::FAULT_NONE;
-        change_control_state(ControlStatus::TRACKING);
-
-        RCLCPP_INFO(
-            get_logger(),
-            "Trajectory %lu accepted: controller=%s config=%s",
-            static_cast<unsigned long>(
-                trajectory_manager_.trajectory_id()),
-            msg->controller_id.c_str(),
-            msg->config_name.c_str());
+        report_trajectory_preparation(
+            msg->trajectory_id,
+            result,
+            reason);
     } catch (const std::exception& e) {
-        RCLCPP_WARN(
+        RCLCPP_ERROR(
             get_logger(),
-            "Trajectory preparation rejected: %s",
+            "Discrete trajectory %lu preparation failed: %s",
+            static_cast<unsigned long>(msg->trajectory_id),
             e.what());
     }
+}
+
+void FlightController::polynomial_trajectory_callback(
+    const PolynomialTraj::SharedPtr msg)
+{
+    if (control_state_ == ControlStatus::FAULT) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Polynomial trajectory %lu rejected: controller in FAULT",
+            static_cast<unsigned long>(msg->trajectory_id));
+        return;
+    }
+
+    try {
+        std::string reason;
+
+        const auto result = trajectory_manager_.prepare(
+            *msg, reason);
+
+        report_trajectory_preparation(
+            msg->trajectory_id,
+            result,
+            reason);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(
+            get_logger(),
+            "Polynomial trajectory %lu preparation failed: %s",
+            static_cast<unsigned long>(msg->trajectory_id),
+            e.what());
+    }
+}
+
+void FlightController::report_trajectory_preparation(
+    uint64_t trajectory_id,
+    drone_node::TrajectoryManager::AcceptResult result,
+    const std::string& reason)
+{
+    if (result ==
+        drone_node::TrajectoryManager::AcceptResult::REJECTED) {
+        RCLCPP_WARN(
+            get_logger(),
+            "Trajectory %lu rejected: %s",
+            static_cast<unsigned long>(trajectory_id),
+            reason.c_str());
+        return;
+    }
+
+    RCLCPP_INFO(
+        get_logger(),
+        "Trajectory %lu prepared: %s",
+        static_cast<unsigned long>(trajectory_id),
+        reason.c_str());
 }
 
 void FlightController::publish_velocity_setpoint(

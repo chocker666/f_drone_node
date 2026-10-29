@@ -10,7 +10,8 @@
 #include <geometry_msgs/msg/quaternion_stamped.hpp>
 
 #include "drone_node/msg/setpoint.hpp"
-#include "drone_node/msg/control_trajectory.hpp"
+#include "drone_node/msg/discrete_traj.hpp"
+#include "drone_node/msg/polynomial_traj.hpp"
 #include "drone_node/msg/control_status.hpp"
 #include "drone_node/msg/control_command.hpp"
 
@@ -33,7 +34,8 @@ private:
     using PointStamped = geometry_msgs::msg::PointStamped;
     using VectorStamped = geometry_msgs::msg::Vector3Stamped;
     using QuaternionStamped = geometry_msgs::msg::QuaternionStamped;
-    using ControlTrajectory = drone_node::msg::ControlTrajectory;
+    using DiscreteTraj = drone_node::msg::DiscreteTraj;
+    using PolynomialTraj = drone_node::msg::PolynomialTraj;
     using ControlStatus = drone_node::msg::ControlStatus;
     using ControlCommand = drone_node::msg::ControlCommand;
     using SteadyClock = drone_node::SteadyClock;
@@ -41,7 +43,14 @@ private:
     void position_callback(const PointStamped::SharedPtr msg);
     void velocity_callback(const VectorStamped::SharedPtr msg);
     void attitude_callback(const QuaternionStamped::SharedPtr msg);
-    void trajectory_callback(const ControlTrajectory::SharedPtr msg);
+    void discrete_trajectory_callback(
+        const DiscreteTraj::SharedPtr msg);
+    void polynomial_trajectory_callback(
+        const PolynomialTraj::SharedPtr msg);
+    void report_trajectory_preparation(
+        uint64_t trajectory_id,
+        drone_node::TrajectoryManager::AcceptResult result,
+        const std::string& reason);
     void command_callback(const ControlCommand::SharedPtr msg);
 
     void control_loop();
@@ -93,7 +102,10 @@ private:
     rclcpp::Subscription<PointStamped>::SharedPtr position_sub_;
     rclcpp::Subscription<VectorStamped>::SharedPtr velocity_sub_;
     rclcpp::Subscription<QuaternionStamped>::SharedPtr attitude_sub_;
-    rclcpp::Subscription<ControlTrajectory>::SharedPtr trajectory_sub_;
+    rclcpp::Subscription<DiscreteTraj>::SharedPtr
+        discrete_trajectory_sub_;
+    rclcpp::Subscription<PolynomialTraj>::SharedPtr
+        polynomial_trajectory_sub_;
     rclcpp::Subscription<ControlCommand>::SharedPtr command_sub_;
 
     rclcpp::Publisher<Setpoint>::SharedPtr setpoint_pub_;
