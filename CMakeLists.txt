@@ -37,9 +37,6 @@ set(INTER_MSG_FILES
 
 set(CTRL_MSG_FILES
   "msg/ControlTrajectory.msg"
-  "msg/FixedTrajectory.msg"
-  "msg/ListTrajectory.msg"
-  "msg/PIDParams.msg"
   "msg/ControlStatus.msg"
   "msg/ControlCommand.msg"
 )
@@ -126,6 +123,21 @@ set(CTRL_SOURCES
   src/ctrl/trajectory_sampler/polynomial_sampler.cpp
 )
 
+set(EXEC_SOURCES
+  src/exec/exec_node.cpp
+  src/exec/motion_executor.cpp
+  src/exec/action_manager.cpp
+  src/exec/actions/arm.cpp
+  src/exec/actions/motion.cpp
+  src/exec/actions/motion_feedback.cpp
+  src/exec/actions/motion_tick.cpp
+  src/exec/actions/hover.cpp
+  src/exec/actions/stop.cpp
+  src/exec/flight_state_machine.cpp
+  src/exec/planner/motion_planner.cpp
+  src/exec/planner/quintic_planner.cpp
+)
+
 # ============================================================
 # PX4 Interface executable
 # ============================================================
@@ -210,38 +222,28 @@ target_link_libraries(drone_node_exec
 # Motion Executor executable
 # ============================================================
 
-# add_executable(motion_executor_exec
-#   src/main/exec_main.cpp
-#   src/exec/exec_node.cpp
-#   src/exec/motion_executor.cpp
-#   src/exec/action_manager.cpp
-#   src/exec/actions/arm.cpp
-#   src/exec/actions/motion.cpp
-#   src/exec/actions/motion_feedback.cpp
-#   src/exec/actions/motion_tick.cpp
-#   src/exec/actions/hover.cpp
-#   src/exec/actions/stop.cpp
-#   src/exec/flight_state_machine.cpp
-#   src/exec/planner/motion_planner.cpp
-#   src/exec/planner/fixed_planner.cpp
-# )
+add_executable(motion_executor_exec
+  src/main/exec_main.cpp
+  ${EXEC_SOURCES}
+)
 
-# target_include_directories(motion_executor_exec PUBLIC
-#   ${DRONE_INCLUDE_DIR}
-# )
+target_include_directories(motion_executor_exec PUBLIC
+  ${DRONE_INCLUDE_DIR}
+)
 
-# ament_target_dependencies(motion_executor_exec
-#   rclcpp
-#   rclcpp_action
-#   std_msgs
-#   std_srvs
-#   geometry_msgs
-# )
+ament_target_dependencies(motion_executor_exec
+  rclcpp
+  rclcpp_action
+  std_msgs
+  std_srvs
+  geometry_msgs
+)
 
-# target_link_libraries(motion_executor_exec
-#   Eigen3::Eigen
-#   "${cpp_typesupport_target}"
-# )
+target_link_libraries(motion_executor_exec
+  Eigen3::Eigen
+  Threads::Threads
+  "${cpp_typesupport_target}"
+)
 
 
 # ============================================================
@@ -249,10 +251,11 @@ target_link_libraries(drone_node_exec
 # ============================================================
 
 install(TARGETS
-  drone_node_exec
+
   px4_interface_exec
   flight_controller_exec
-  # motion_executor_exec
+  drone_node_exec
+  motion_executor_exec
   DESTINATION lib/${PROJECT_NAME}
 )
 
