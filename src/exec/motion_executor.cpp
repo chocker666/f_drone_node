@@ -1,22 +1,159 @@
+
 #include "drone_node/exec/motion_executor.hpp"
 
-#include <cmath>
-#include <string>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace drone_node::exec
 {
 
-MotionExecutor::MotionExecutor(
-    rclcpp::Node& node, rclcpp::CallbackGroup::SharedPtr motion_group)
-    : node_(node), motion_group_(std::move(motion_group))
+namespace
 {
-    if (!motion_group_)
-        throw std::invalid_argument("MotionExecutor requires motion callback group");
+
+// Polynomial coefficients are stored in ascending order:
+// c0 + c1*t + ... + c5*t^5.
+double evaluatePolynomial(
+    const std::vector<double>& coefficients,
+    std::size_t offset,
+    double t)
+{
+    double result = coefficients[offset + 5];
+
+    for (int i = 4; i >= 0; --i) {
+        result = result * t +
+            coefficients[offset + static_cast<std::size_t>(i)];
+    }
+
+    return result;
+}
+
+bool finiteArray(const std::vector<double>& values)
+{
+    return std::all_of(
+        values.begin(), values.end(),
+        [](double value) {
+            return std::isfinite(value);
+        });
+}
+
+struct TrajectoryEndpoint
+{
+    geometry_msgs::msg::Point position;
+    double yaw{0.0};
+    double duration{0.0};
+};
+
+bool extractTrajectoryEndpoint(
+    const drone_node::msg::ControlTrajectory& trajectory,
+    TrajectoryEndpoint& endpoint,
+    std::string& reason)
+{
+    if (trajectory.frame_id != "map") {
+        reason = "Trajectory frame must be map";
+        return false;
+    }
+
+    if (trajectory.segment_count == 0) {
+        reason = "Trajectory must contain at least one segment";
+        return false;
+    }
+
+    const auto count =
+        static_cast<std::size_t>(trajectory.segment_count);
+
+    if (count > std::numeric_limits<std::size_t>::max() / 6) {
+        reason = "Trajectory segment count overflow";
+        return false;
+    }
+
+    if (trajectory.segment_duration.size() != count ||
+        trajectory.coeff_x.size() != count * 6 ||
+        trajectory.coeff_y.size() != count * 6 ||
+        trajectory.coeff_z.size() != count * 6 ||
+        trajectory.coeff_yaw.size() != count * 6) {
+        reason = "Trajectory segment and coefficient sizes mismatch";
+        return false;
+    }
+
+    if (trajectory.controller_id.empty() ||
+        trajectory.config_name.empty()) {
+        reason = "Trajectory controller identity is empty";
+        return false;
+    }
+
+    if (!finiteArray(trajectory.coeff_x) ||
+        !finiteArray(trajectory.coeff_y) ||
+        !finiteArray(trajectory.coeff_z) ||
+        !finiteArray(trajectory.coeff_yaw)) {
+        reason = "Trajectory contains non-finite coefficients";
+        return false;
+    }
+
+    double duration = 0.0;
+
+    for (double segment_duration : trajectory.segment_duration) {
+        if (!std::isfinite(segment_duration) ||
+            segment_duration <= 0.0) {
+            reason = "Invalid trajectory segment duration";
+            return false;
+        }
+
+        duration += segment_duration;
+
+        if (!std::isfinite(duration)) {
+            reason = "Trajectory total duration overflow";
+            return false;
+        }
+    }
+
+    const std::size_t offset = (count - 1) * 6;
+    const double t = trajectory.segment_duration.back();
+
+    endpoint.position.x =
+        evaluatePolynomial(trajectory.coeff_x, offset, t);
+    endpoint.position.y =
+        evaluatePolynomial(trajectory.coeff_y, offset, t);
+    endpoint.position.z =
+        evaluatePolynomial(trajectory.coeff_z, offset, t);
+    endpoint.yaw =
+        evaluatePolynomial(trajectory.coeff_yaw, offset, t);
+    endpoint.duration = duration;
+
+    if (!std::isfinite(endpoint.position.x) ||
+        !std::isfinite(endpoint.position.y) ||
+        !std::isfinite(endpoint.position.z) ||
+        !std::isfinite(endpoint.yaw)) {
+        reason = "Trajectory endpoint is non-finite";
+        return false;
+    }
+
+    return true;
+}
+
+}  // namespace
+
+// ============================================================
+// Construction
+// ============================================================
+
+MotionExecutor::MotionExecutor(
+    rclcpp::Node& node,
+    rclcpp::CallbackGroup::SharedPtr motion_group)
+    : node_(node),
+      motion_group_(std::move(motion_group))
+{
+    if (!motion_group_) {
+        throw std::invalid_argument(
+            "MotionExecutor requires motion callback group");
+    }
+
     rclcpp::SubscriptionOptions subscription_options;
     subscription_options.callback_group = motion_group_;
 
@@ -28,35 +165,43 @@ MotionExecutor::MotionExecutor(
             parameter, default_value);
     };
 
-    trajectory_pub_ = node_.create_publisher<ControlTrajectory>(
-        topic(
-            "topics.trajectory",
-            "/flight_controller/in/trajectory"),
-        rclcpp::QoS(1).reliable());
+    trajectory_pub_ =
+        node_.create_publisher<ControlTrajectory>(
+            topic(
+                "topics.trajectory",
+                "/flight_controller/in/trajectory"),
+            rclcpp::QoS(1).reliable());
 
-    command_pub_ = node_.create_publisher<ControlCommand>(
-        topic(
-            "topics.command",
-            "/flight_controller/in/command"),
-        rclcpp::QoS(10).reliable());
+    command_pub_ =
+        node_.create_publisher<ControlCommand>(
+            topic(
+                "topics.command",
+                "/flight_controller/in/command"),
+            rclcpp::QoS(10).reliable());
 
-    control_status_sub_ = node_.create_subscription<ControlStatus>(
-        topic(
-            "topics.control_status",
-            "/flight_controller/out/control_status"),
-        rclcpp::QoS(10).reliable(),
-        [this](ControlStatus::ConstSharedPtr message)
-        {
-            // position_error/yaw_error 在部分状态下允许为 NaN。
-            // FAULT 是有效状态报告，不应因为处于 FAULT 而丢弃。
-            const bool valid = message->state <= ControlStatus::FAULT;
-            updateCache(state_.control_status, *message, valid);
-        }, subscription_options);
+    control_status_sub_ =
+        node_.create_subscription<ControlStatus>(
+            topic(
+                "topics.control_status",
+                "/flight_controller/out/control_status"),
+            rclcpp::QoS(10).reliable(),
+            [this](ControlStatus::ConstSharedPtr message)
+            {
+                const bool valid =
+                    message->state <= ControlStatus::FAULT;
+
+                updateCache(
+                    state_.control_status,
+                    *message,
+                    valid);
+            },
+            subscription_options);
 
     const auto state_qos = rclcpp::QoS(1).reliable();
 
     position_sub_ =
-        node_.create_subscription<geometry_msgs::msg::PointStamped>(
+        node_.create_subscription<
+            geometry_msgs::msg::PointStamped>(
             topic(
                 "topics.position",
                 "/px4_interface/out/position"),
@@ -64,17 +209,21 @@ MotionExecutor::MotionExecutor(
             [this](
                 geometry_msgs::msg::PointStamped::ConstSharedPtr message)
             {
-                const auto& position = message->point;
-                const bool valid =
-                    std::isfinite(position.x) &&
-                    std::isfinite(position.y) &&
-                    std::isfinite(position.z);
+                const auto& p = message->point;
 
-                updateCache(state_.position, *message, valid);
-            }, subscription_options);
+                const bool valid =
+                    std::isfinite(p.x) &&
+                    std::isfinite(p.y) &&
+                    std::isfinite(p.z);
+
+                updateCache(
+                    state_.position, *message, valid);
+            },
+            subscription_options);
 
     velocity_sub_ =
-        node_.create_subscription<geometry_msgs::msg::Vector3Stamped>(
+        node_.create_subscription<
+            geometry_msgs::msg::Vector3Stamped>(
             topic(
                 "topics.velocity",
                 "/px4_interface/out/velocity"),
@@ -82,17 +231,21 @@ MotionExecutor::MotionExecutor(
             [this](
                 geometry_msgs::msg::Vector3Stamped::ConstSharedPtr message)
             {
-                const auto& velocity = message->vector;
-                const bool valid =
-                    std::isfinite(velocity.x) &&
-                    std::isfinite(velocity.y) &&
-                    std::isfinite(velocity.z);
+                const auto& v = message->vector;
 
-                updateCache(state_.velocity, *message, valid);
-            }, subscription_options);
+                const bool valid =
+                    std::isfinite(v.x) &&
+                    std::isfinite(v.y) &&
+                    std::isfinite(v.z);
+
+                updateCache(
+                    state_.velocity, *message, valid);
+            },
+            subscription_options);
 
     attitude_sub_ =
-        node_.create_subscription<geometry_msgs::msg::QuaternionStamped>(
+        node_.create_subscription<
+            geometry_msgs::msg::QuaternionStamped>(
             topic(
                 "topics.attitude",
                 "/px4_interface/out/attitude"),
@@ -100,58 +253,75 @@ MotionExecutor::MotionExecutor(
             [this](
                 geometry_msgs::msg::QuaternionStamped::ConstSharedPtr message)
             {
-                const auto& attitude = message->quaternion;
+                const auto& q = message->quaternion;
+
                 const double norm = std::hypot(
-                    std::hypot(attitude.x, attitude.y),
-                    std::hypot(attitude.z, attitude.w));
+                    std::hypot(q.x, q.y),
+                    std::hypot(q.z, q.w));
 
                 const bool valid =
-                    std::isfinite(attitude.x) &&
-                    std::isfinite(attitude.y) &&
-                    std::isfinite(attitude.z) &&
-                    std::isfinite(attitude.w) &&
+                    std::isfinite(q.x) &&
+                    std::isfinite(q.y) &&
+                    std::isfinite(q.z) &&
+                    std::isfinite(q.w) &&
                     std::isfinite(norm) &&
                     std::abs(norm - 1.0) <= 1.0e-3;
 
-                updateCache(state_.attitude, *message, valid);
-            }, subscription_options);
+                updateCache(
+                    state_.attitude, *message, valid);
+            },
+            subscription_options);
 
-    armed_sub_ = node_.create_subscription<std_msgs::msg::Bool>(
-        topic("topics.armed", "/px4_interface/out/arm"),
-        state_qos,
-        [this](std_msgs::msg::Bool::ConstSharedPtr message)
-        {
-            updateCache(state_.armed, *message, true);
-        }, subscription_options);
+    armed_sub_ =
+        node_.create_subscription<std_msgs::msg::Bool>(
+            topic(
+                "topics.armed",
+                "/px4_interface/out/arm"),
+            state_qos,
+            [this](std_msgs::msg::Bool::ConstSharedPtr message)
+            {
+                updateCache(state_.armed, *message, true);
+            },
+            subscription_options);
 
-    landed_sub_ = node_.create_subscription<std_msgs::msg::Bool>(
-        topic("topics.landed", "/px4_interface/out/landed"),
-        state_qos,
-        [this](std_msgs::msg::Bool::ConstSharedPtr message)
-        {
-            updateCache(state_.landed, *message, true);
-        }, subscription_options);
+    landed_sub_ =
+        node_.create_subscription<std_msgs::msg::Bool>(
+            topic(
+                "topics.landed",
+                "/px4_interface/out/landed"),
+            state_qos,
+            [this](std_msgs::msg::Bool::ConstSharedPtr message)
+            {
+                updateCache(state_.landed, *message, true);
+            },
+            subscription_options);
 
-    connected_sub_ = node_.create_subscription<std_msgs::msg::Bool>(
-        topic(
-            "topics.connected",
-            "/px4_interface/out/connected"),
-        state_qos,
-        [this](std_msgs::msg::Bool::ConstSharedPtr message)
-        {
-            updateCache(state_.connected, *message, true);
-        }, subscription_options);
+    connected_sub_ =
+        node_.create_subscription<std_msgs::msg::Bool>(
+            topic(
+                "topics.connected",
+                "/px4_interface/out/connected"),
+            state_qos,
+            [this](std_msgs::msg::Bool::ConstSharedPtr message)
+            {
+                updateCache(state_.connected, *message, true);
+            },
+            subscription_options);
 
     arm_client_ = node_.create_client<SetArming>(
-        topic("services.arm", "/px4_interface/in/arm"),
-        rmw_qos_profile_services_default, motion_group_);
+        topic(
+            "services.arm",
+            "/px4_interface/in/arm"),
+        rmw_qos_profile_services_default,
+        motion_group_);
 
-            const auto positive_parameter = [this](
+    const auto positive_parameter = [this](
         const std::string& name,
         double default_value)
     {
         const double value =
-            node_.declare_parameter<double>(name, default_value);
+            node_.declare_parameter<double>(
+                name, default_value);
 
         if (!std::isfinite(value) || value <= 0.0) {
             throw std::invalid_argument(
@@ -161,7 +331,7 @@ MotionExecutor::MotionExecutor(
         return value;
     };
 
-        status_timeout_ = positive_parameter(
+    status_timeout_ = positive_parameter(
         "execution.status_timeout", 1.5);
 
     hover_position_tolerance_ = positive_parameter(
@@ -203,7 +373,8 @@ MotionExecutor::MotionExecutor(
 
     const auto period =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::duration<double>(1.0 / check_frequency));
+            std::chrono::duration<double>(
+                1.0 / check_frequency));
 
     if (period.count() <= 0) {
         throw std::invalid_argument(
@@ -211,24 +382,33 @@ MotionExecutor::MotionExecutor(
     }
 
     execution_timer_ = node_.create_wall_timer(
-        period, [this] { updateExecution(); }, motion_group_);
+        period,
+        [this] { updateExecution(); },
+        motion_group_);
 
     RCLCPP_INFO(
         node_.get_logger(),
-        "MotionExecutor communication, execution and "
-        "real-state observation initialized; "
-        "Action servers are not enabled");
+        "MotionExecutor initialized with polynomial "
+        "trajectory execution support");
 }
+
+// ============================================================
+// Lifecycle and communication
+// ============================================================
 
 void MotionExecutor::stop()
 {
     execution_timer_->cancel();
-    // Best effort only: no callbacks can confirm a stop once spin has returned.
-    // Never wait for a response from this executor during teardown.
-    if (rclcpp::ok(node_.get_node_base_interface()->get_context())) {
+
+    if (rclcpp::ok(
+            node_.get_node_base_interface()->get_context())) {
         const auto execution = getExecutionSnapshot();
-        if (execution.phase != ExecutionPhase::IDLE)
-            requestStop(execution.trajectory_id, StopReason::CLIENT_CANCEL);
+
+        if (execution.phase != ExecutionPhase::IDLE) {
+            requestStop(
+                execution.trajectory_id,
+                StopReason::CLIENT_CANCEL);
+        }
     }
 }
 
@@ -250,6 +430,10 @@ MotionExecutor::getStateSnapshot() const
     std::lock_guard<std::mutex> lock(state_mutex_);
     return state_;
 }
+
+// ============================================================
+// Arm service
+// ============================================================
 
 bool MotionExecutor::armServiceReady() const
 {
@@ -275,6 +459,10 @@ bool MotionExecutor::removePendingArmRequest(
     return arm_client_->remove_pending_request(request_id);
 }
 
+// ============================================================
+// Utility functions
+// ============================================================
+
 std::int64_t MotionExecutor::statusStamp(
     const ControlStatus& status)
 {
@@ -288,7 +476,6 @@ double MotionExecutor::yawOf(
 {
     const auto& q = attitude.quaternion;
 
-    // 缓存已经检查四元数有效性；这里归一化后求 Yaw。
     const double norm = std::hypot(
         std::hypot(q.x, q.y),
         std::hypot(q.z, q.w));
@@ -361,9 +548,8 @@ std::string MotionExecutor::stateProblem(
         return "Vehicle connection unavailable or disconnected";
     }
 
-    if (!statusFresh(state.armed, time)) {
+    if (!statusFresh(state.armed, time))
         return "Vehicle armed state unavailable or stale";
-    }
 
     const bool confirmed_disarmed_on_ground =
         allow_ground_disarmed &&
@@ -387,6 +573,10 @@ bool MotionExecutor::statusAfter(
            statusStamp(state.control_status.message) >
                context.status_stamp_floor;
 }
+
+// ============================================================
+// Start polynomial trajectory execution
+// ============================================================
 
 std::optional<std::uint64_t> MotionExecutor::startExecution(
     ControlTrajectory trajectory,
@@ -414,18 +604,20 @@ std::optional<std::uint64_t> MotionExecutor::startExecution(
         return std::nullopt;
     }
 
-    const auto& target = trajectory.point_params;
+    TrajectoryEndpoint endpoint;
 
-    if (trajectory.frame_id != "map" ||
-        trajectory.trajectory_type != ControlTrajectory::POINT ||
-        !std::isfinite(target.position.x) ||
-        !std::isfinite(target.position.y) ||
-        !std::isfinite(target.position.z) ||
-        !std::isfinite(target.yaw) ||
-        target.yaw_direction > 2 ||
-        trajectory.controller_id.empty() ||
-        trajectory.config_name.empty()) {
-        rejection_reason = "Invalid map POINT trajectory";
+    if (!extractTrajectoryEndpoint(
+            trajectory, endpoint, rejection_reason)) {
+        return std::nullopt;
+    }
+
+    // The overall timeout includes tracking acknowledgment,
+    // trajectory execution and final settling.
+    if (constraints.timeout <=
+        endpoint.duration + constraints.settle_duration) {
+        rejection_reason =
+            "Execution timeout must exceed trajectory "
+            "duration plus settle duration";
         return std::nullopt;
     }
 
@@ -433,6 +625,7 @@ std::optional<std::uint64_t> MotionExecutor::startExecution(
     const auto time = Clock::now();
 
     rejection_reason = stateProblem(state, time);
+
     if (!rejection_reason.empty())
         return std::nullopt;
 
@@ -449,8 +642,6 @@ std::optional<std::uint64_t> MotionExecutor::startExecution(
         return std::nullopt;
     }
 
-    // 进程内所有 MotionExecutor 实例共用分配器。
-    // 实时时钟纳秒作为初值，之后只递增，避免进程内重复。
     static std::atomic<std::uint64_t> next_id{
         static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -460,7 +651,8 @@ std::optional<std::uint64_t> MotionExecutor::startExecution(
     auto previous = next_id.load(std::memory_order_relaxed);
 
     for (;;) {
-        if (previous == std::numeric_limits<std::uint64_t>::max()) {
+        if (previous ==
+            std::numeric_limits<std::uint64_t>::max()) {
             rejection_reason = "Trajectory ID space exhausted";
             return std::nullopt;
         }
@@ -475,8 +667,14 @@ std::optional<std::uint64_t> MotionExecutor::startExecution(
     }
 
     ExecutionContext context;
+
     context.trajectory = std::move(trajectory);
     context.constraints = constraints;
+
+    context.target_position = endpoint.position;
+    context.target_yaw = endpoint.yaw;
+    context.trajectory_duration = endpoint.duration;
+
     context.started_at = time;
     context.phase_started_at = time;
     context.status_stamp_floor = statusStamp(status);
@@ -488,13 +686,20 @@ std::optional<std::uint64_t> MotionExecutor::startExecution(
     }
     catch (const std::exception& error) {
         execution_.reset();
+
         rejection_reason =
-            std::string("Trajectory publish failed: ") + error.what();
+            std::string("Trajectory publish failed: ") +
+            error.what();
+
         return std::nullopt;
     }
 
     return execution_->trajectory.trajectory_id;
 }
+
+// ============================================================
+// Stop / cancel
+// ============================================================
 
 bool MotionExecutor::requestStop(
     std::uint64_t trajectory_id,
@@ -515,14 +720,21 @@ bool MotionExecutor::requestStop(
     auto& context = *execution_;
 
     if (context.phase == ExecutionPhase::WAITING_HOVER) {
-        // 故障结论优先；客户端放弃优先于可恢复的 Stop。
-        // 不重置停止期限，也不重复发送 CANCEL。
         if (context.stop_reason != StopReason::FAILURE &&
             (reason == StopReason::CLIENT_CANCEL ||
              context.stop_reason == StopReason::COMPLETED)) {
             context.stop_reason = reason;
         }
 
+        return true;
+    }
+
+    // A trajectory not yet confirmed by CTRL cannot safely
+    // be canceled with the current unaddressed CANCEL command.
+    if (context.phase == ExecutionPhase::WAITING_TRACKING) {
+        // Keep the execution active until its acceptance
+        // status is resolved. Do not publish CANCEL here.
+        context.stop_reason = reason;
         return true;
     }
 
@@ -559,6 +771,10 @@ void MotionExecutor::setExecutionCallback(
     execution_callback_ = std::move(callback);
 }
 
+// ============================================================
+// Transition to HOVER
+// ============================================================
+
 void MotionExecutor::beginStopping(
     ExecutionContext& context,
     const StateSnapshot& state,
@@ -568,8 +784,10 @@ void MotionExecutor::beginStopping(
 {
     context.phase = ExecutionPhase::WAITING_HOVER;
     context.phase_started_at = time;
+
     context.status_stamp_floor =
         statusStamp(state.control_status.message);
+
     context.stop_reason = reason;
     context.failure = failure;
     context.stability_started = false;
@@ -577,13 +795,23 @@ void MotionExecutor::beginStopping(
 
     const bool already_hovering =
         fresh(state.control_status, time) &&
-        state.control_status.message.state == ControlStatus::HOVER &&
+        state.control_status.message.state ==
+            ControlStatus::HOVER &&
         state.control_status.message.trajectory_id == 0;
 
-    // 即使已经 HOVER，也要等待本次停止请求之后的新鲜状态。
-    // 此时不重复发送没有意义的 CANCEL。
     if (already_hovering)
         return;
+
+    // Do not cancel a known different trajectory.
+    if (state.control_status.message.state ==
+            ControlStatus::TRACKING &&
+        state.control_status.message.trajectory_id !=
+            context.trajectory.trajectory_id) {
+        context.stop_reason = StopReason::FAILURE;
+        context.failure =
+            "Refusing to cancel another trajectory";
+        return;
+    }
 
     ControlCommand command;
     command.command = ControlCommand::CANCEL;
@@ -594,9 +822,14 @@ void MotionExecutor::beginStopping(
     catch (const std::exception& error) {
         context.stop_reason = StopReason::FAILURE;
         context.failure =
-            std::string("CANCEL publish failed: ") + error.what();
+            std::string("CANCEL publish failed: ") +
+            error.what();
     }
 }
+
+// ============================================================
+// Position / yaw / velocity settling
+// ============================================================
 
 bool MotionExecutor::settled(
     ExecutionContext& context,
@@ -610,22 +843,23 @@ bool MotionExecutor::settled(
 
     const auto& target_position = hover
         ? context.hover_position
-        : context.trajectory.point_params.position;
+        : context.target_position;
 
     const double target_yaw = hover
         ? context.hover_yaw
-        : context.trajectory.point_params.yaw;
+        : context.target_yaw;
 
     const double position_error = std::hypot(
         position.x - target_position.x,
         position.y - target_position.y,
         position.z - target_position.z);
 
-    const double speed =
-        std::hypot(velocity.x, velocity.y, velocity.z);
+    const double speed = std::hypot(
+        velocity.x, velocity.y, velocity.z);
 
     const bool within_tolerance =
-        position_error <= context.constraints.position_tolerance &&
+        position_error <=
+            context.constraints.position_tolerance &&
         yawDistance(yaw, target_yaw) <=
             context.constraints.yaw_tolerance &&
         speed <= context.constraints.velocity_tolerance;
@@ -633,8 +867,6 @@ bool MotionExecutor::settled(
     if (!within_tolerance) {
         context.stability_started = false;
 
-        // Stop/Cancel 的悬停稳定窗口从当前位置重新建立。
-        // 正常完成必须继续保持原任务目标。
         if (hover &&
             context.stop_reason != StopReason::COMPLETED) {
             context.hover_position = position;
@@ -650,7 +882,6 @@ bool MotionExecutor::settled(
         return false;
     }
 
-    // 稳定窗口内必须收到新的真实位置、速度和姿态数据。
     return std::chrono::duration<double>(
                time - context.stable_since).count() >=
                context.constraints.settle_duration &&
@@ -659,13 +890,20 @@ bool MotionExecutor::settled(
            state.attitude.received_at > context.stable_since;
 }
 
+// ============================================================
+// Finish execution
+// ============================================================
+
 MotionExecutor::ExecutionEvent
 MotionExecutor::finishExecution(bool safe_stop_confirmed)
 {
     const auto& context = *execution_;
 
     ExecutionEvent event;
-    event.trajectory_id = context.trajectory.trajectory_id;
+
+    event.trajectory_id =
+        context.trajectory.trajectory_id;
+
     event.stop_reason = context.stop_reason;
     event.safe_stop_confirmed = safe_stop_confirmed;
 
@@ -679,7 +917,8 @@ MotionExecutor::finishExecution(bool safe_stop_confirmed)
 
     case StopReason::STOP:
         event.outcome = ExecutionOutcome::STOPPED;
-        event.message = "Stop completed; stable HOVER confirmed";
+        event.message =
+            "Stop completed; stable HOVER confirmed";
         break;
 
     case StopReason::CLIENT_CANCEL:
@@ -698,6 +937,10 @@ MotionExecutor::finishExecution(bool safe_stop_confirmed)
     return event;
 }
 
+// ============================================================
+// Execution state machine
+// ============================================================
+
 void MotionExecutor::updateExecution()
 {
     std::optional<ExecutionEvent> event;
@@ -709,11 +952,11 @@ void MotionExecutor::updateExecution()
         const auto state = getStateSnapshot();
         const auto time = Clock::now();
 
-        // 即使当前没有任务，也持续建立真实悬停观测。
         updateHoverObservation(state, time);
 
         if (!execution_)
             return;
+
         auto& context = *execution_;
         const auto& status = state.control_status.message;
 
@@ -723,11 +966,15 @@ void MotionExecutor::updateExecution()
                 time - start).count();
         };
 
-        const auto fail_now = [&](
-            const std::string& message)
+        const auto fail_now = [&](const std::string& message)
         {
-            // 故障/失效时只尽力请求停止，不宣称安全停止成功。
-            if (context.phase != ExecutionPhase::WAITING_HOVER) {
+            // Only attempt CANCEL when the current
+            // trajectory has been confirmed as TRACKING.
+            if (context.phase == ExecutionPhase::TRACKING &&
+                fresh(state.control_status, time) &&
+                status.state == ControlStatus::TRACKING &&
+                status.trajectory_id ==
+                    context.trajectory.trajectory_id) {
                 beginStopping(
                     context, state, time,
                     StopReason::FAILURE, message);
@@ -743,7 +990,6 @@ void MotionExecutor::updateExecution()
             time,
             context.constraints.complete_on_landed);
 
-        // 异常优先于到达与普通完成。
         if (!problem.empty()) {
             fail_now(problem);
         }
@@ -758,25 +1004,27 @@ void MotionExecutor::updateExecution()
             (context.constraints.require_airborne ||
              context.constraints.complete_on_landed) &&
             !statusFresh(state.landed, time)) {
-            fail_now("Landed observation unavailable or stale");
+            fail_now(
+                "Landed observation unavailable or stale");
         }
         else if (
             context.constraints.require_airborne &&
             context.phase == ExecutionPhase::WAITING_HOVER &&
             context.stop_reason == StopReason::COMPLETED &&
             state.landed.message.data) {
-            fail_now("Unexpected ground contact during motion completion");
+            fail_now(
+                "Unexpected ground contact during motion completion");
         }
         else {
-            const bool later_status = statusAfter(state, context);
+            const bool later_status =
+                statusAfter(state, context);
 
             switch (context.phase) {
             case ExecutionPhase::WAITING_TRACKING:
+            {
                 if (age(context.started_at) >=
                     context.constraints.timeout) {
-                    beginStopping(
-                        context, state, time,
-                        StopReason::FAILURE,
+                    fail_now(
                         "Execution timeout before TRACKING");
                 }
                 else if (
@@ -785,33 +1033,45 @@ void MotionExecutor::updateExecution()
                     status.trajectory_id ==
                         context.trajectory.trajectory_id) {
                     context.phase = ExecutionPhase::TRACKING;
+                    context.tracking_confirmed_at = time;
                     context.stability_started = false;
+
+                    // STOP/CANCEL requested before acknowledgment:
+                    // now it is safe to address the active task.
+                    if (context.stop_reason ==
+                            StopReason::STOP ||
+                        context.stop_reason ==
+                            StopReason::CLIENT_CANCEL) {
+                        const auto reason = context.stop_reason;
+                        beginStopping(
+                            context, state, time, reason);
+                    }
                 }
                 else if (
                     later_status &&
                     status.state == ControlStatus::TRACKING &&
                     status.trajectory_id !=
                         context.trajectory.trajectory_id) {
-                    fail_now("Ctrl is tracking another trajectory");
+                    fail_now(
+                        "Ctrl is tracking another trajectory");
                 }
                 else if (
                     age(context.phase_started_at) >=
                     tracking_ack_timeout_) {
-                    beginStopping(
-                        context, state, time,
-                        StopReason::FAILURE,
+                    fail_now(
                         "TRACKING confirmation timeout");
                 }
+
                 break;
+            }
 
             case ExecutionPhase::TRACKING:
+            {
                 if (
                     status.state != ControlStatus::TRACKING ||
                     status.trajectory_id !=
                         context.trajectory.trajectory_id) {
-                    beginStopping(
-                        context, state, time,
-                        StopReason::FAILURE,
+                    fail_now(
                         "Ctrl left the expected TRACKING state");
                 }
                 else if (
@@ -823,8 +1083,6 @@ void MotionExecutor::updateExecution()
                         "Execution timeout");
                 }
                 else if (context.constraints.complete_on_landed) {
-                    // Land 不根据地下目标位置完成。
-                    // 首次新鲜接地观测到达后，立即停止下降。
                     context.stability_started = false;
 
                     if (state.landed.message.data) {
@@ -838,18 +1096,29 @@ void MotionExecutor::updateExecution()
                 else if (
                     context.constraints.require_airborne &&
                     state.landed.message.data) {
-                    // 尚未离地不能累计到达稳定时间。
                     context.stability_started = false;
                 }
-                else if (settled(context, state, time, false)) {
+                else if (
+                    age(context.tracking_confirmed_at) <
+                    context.trajectory_duration) {
+                    // Never finish a normal trajectory
+                    // before its planned duration.
+                    context.stability_started = false;
+                }
+                else if (settled(
+                    context, state, time, false)) {
                     beginStopping(
                         context, state, time,
                         StopReason::COMPLETED);
                 }
+
                 break;
+            }
 
             case ExecutionPhase::WAITING_HOVER:
-                if (age(context.phase_started_at) >= stop_timeout_) {
+            {
+                if (age(context.phase_started_at) >=
+                    stop_timeout_) {
                     fail_now(
                         "Safe stop timeout; stable HOVER unconfirmed");
                 }
@@ -861,18 +1130,17 @@ void MotionExecutor::updateExecution()
                         context.hover_confirmed = true;
                         context.stability_started = false;
 
-                        if (context.stop_reason ==
+                        if (
+                            context.stop_reason ==
                                 StopReason::COMPLETED &&
                             !context.constraints.complete_on_landed) {
                             context.hover_position =
-                                context.trajectory.point_params.position;
+                                context.target_position;
 
                             context.hover_yaw =
-                                context.trajectory.point_params.yaw;
+                                context.target_yaw;
                         }
                         else {
-                            // Land 接地后围绕真实接地点确认稳定，
-                            // 不再围绕地下参考点判定。
                             context.hover_position =
                                 state.position.message.point;
 
@@ -880,45 +1148,49 @@ void MotionExecutor::updateExecution()
                                 context.constraints.complete_on_landed &&
                                 context.stop_reason ==
                                     StopReason::COMPLETED
-                                    ? context.trajectory.point_params.yaw
+                                    ? context.target_yaw
                                     : yawOf(state.attitude.message);
                         }
                     }
                     else if (
                         age(context.phase_started_at) >=
                         hover_ack_timeout_) {
-                        fail_now("HOVER confirmation timeout");
+                        fail_now(
+                            "HOVER confirmation timeout");
                     }
                 }
                 else if (
                     !later_status ||
                     status.state != ControlStatus::HOVER ||
                     status.trajectory_id != 0) {
-                    fail_now("Ctrl left HOVER during stop confirmation");
+                    fail_now(
+                        "Ctrl left HOVER during stop confirmation");
                 }
                 else if (
                     context.constraints.complete_on_landed &&
                     context.stop_reason == StopReason::COMPLETED &&
                     !state.landed.message.data) {
-                    // 接地信号回退，不能累计稳定时间。
-                    // 不自动重新启动下降，等待确认或超时。
                     context.stability_started = false;
                 }
                 else {
-                    const bool stable =
-                        settled(context, state, time, true);
+                    const bool stable = settled(
+                        context, state, time, true);
 
                     const bool ground_confirmed =
                         !context.constraints.complete_on_landed ||
-                        context.stop_reason != StopReason::COMPLETED ||
+                        context.stop_reason !=
+                            StopReason::COMPLETED ||
                         (state.landed.message.data &&
                          state.landed.received_at >
                              context.stable_since);
 
-                    if (stable && ground_confirmed)
+                    if (stable && ground_confirmed) {
                         event = finishExecution(true);
+                    }
                 }
+
                 break;
+            }
 
             case ExecutionPhase::IDLE:
                 break;
@@ -928,12 +1200,12 @@ void MotionExecutor::updateExecution()
         callback = execution_callback_;
     }
 
-    // 不能在持锁期间调用上层模块。
     if (event) {
         RCLCPP_INFO(
             node_.get_logger(),
             "Trajectory %llu outcome=%d safe_stop=%s: %s",
-            static_cast<unsigned long long>(event->trajectory_id),
+            static_cast<unsigned long long>(
+                event->trajectory_id),
             static_cast<int>(event->outcome),
             event->safe_stop_confirmed ? "true" : "false",
             event->message.c_str());
@@ -951,62 +1223,16 @@ void MotionExecutor::updateExecution()
             catch (...) {
                 RCLCPP_ERROR(
                     node_.get_logger(),
-                    "Execution callback failed with unknown exception");
+                    "Execution callback failed "
+                    "with unknown exception");
             }
         }
     }
 }
 
-std::optional<std::uint64_t> MotionExecutor::startExecution(
-    const PlannedMotion& motion,
-    const ExecutionConstraints& constraints,
-    std::string& rejection_reason)
-{
-    rejection_reason.clear();
-
-    if (motion.planner_type != PlannerType::FIXED ||
-        motion.motion_type != PlannedMotionType::POINT) {
-        rejection_reason = "Only FIXED POINT motion is supported";
-        return std::nullopt;
-    }
-
-    // 同样校验直接构造的 PlannedMotion，
-    // 不假定所有调用方都经过了 FixedPlanner。
-    if (motion.frame_id != "map" ||
-        !motion.target_position.allFinite() ||
-        !std::isfinite(motion.target_yaw) ||
-        motion.yaw_direction > 2 ||
-        motion.controller_id != "position_yaw_pid" ||
-        motion.config_name.empty()) {
-        rejection_reason = "Invalid planned FIXED POINT motion";
-        return std::nullopt;
-    }
-
-    ControlTrajectory trajectory;
-
-    // 轨迹 ID 由阶段 2 的执行入口统一分配。
-    trajectory.frame_id = motion.frame_id;
-    trajectory.trajectory_type = ControlTrajectory::POINT;
-
-    trajectory.point_params.position.x =
-        motion.target_position.x();
-    trajectory.point_params.position.y =
-        motion.target_position.y();
-    trajectory.point_params.position.z =
-        motion.target_position.z();
-
-    trajectory.point_params.yaw = motion.target_yaw;
-    trajectory.point_params.yaw_direction =
-        motion.yaw_direction;
-
-    trajectory.controller_id = motion.controller_id;
-    trajectory.config_name = motion.config_name;
-
-    return startExecution(
-        std::move(trajectory),
-        constraints,
-        rejection_reason);
-}
+// ============================================================
+// Vehicle snapshot
+// ============================================================
 
 VehicleSnapshot MotionExecutor::buildVehicleSnapshot(
     const StateSnapshot& state,
@@ -1015,13 +1241,16 @@ VehicleSnapshot MotionExecutor::buildVehicleSnapshot(
     VehicleSnapshot result;
     result.captured_at = time;
 
-    result.connected_valid = statusFresh(state.connected, time);
+    result.connected_valid =
+        statusFresh(state.connected, time);
     result.connected = state.connected.message.data;
 
-    result.armed_valid = statusFresh(state.armed, time);
+    result.armed_valid =
+        statusFresh(state.armed, time);
     result.armed = state.armed.message.data;
 
-    result.landed_valid = statusFresh(state.landed, time);
+    result.landed_valid =
+        statusFresh(state.landed, time);
     result.landed = state.landed.message.data;
 
     result.position_valid =
@@ -1079,18 +1308,24 @@ VehicleSnapshot MotionExecutor::buildVehicleSnapshot(
 
 VehicleSnapshot MotionExecutor::getVehicleSnapshot() const
 {
-    // 与执行循环保持相同锁顺序：execution → state。
     std::lock_guard<std::mutex> lock(execution_mutex_);
 
     const auto state = getStateSnapshot();
-    return buildVehicleSnapshot(state, Clock::now());
+
+    return buildVehicleSnapshot(
+        state, Clock::now());
 }
+
+// ============================================================
+// Independent HOVER observation
+// ============================================================
 
 void MotionExecutor::updateHoverObservation(
     const StateSnapshot& state,
     Clock::time_point time)
 {
-    const auto observation = buildVehicleSnapshot(state, time);
+    const auto observation =
+        buildVehicleSnapshot(state, time);
 
     const bool ready =
         observation.connected_valid &&
@@ -1115,8 +1350,8 @@ void MotionExecutor::updateHoverObservation(
     const auto& velocity = state.velocity.message.vector;
     const double yaw = yawOf(state.attitude.message);
 
-    const double speed =
-        std::hypot(velocity.x, velocity.y, velocity.z);
+    const double speed = std::hypot(
+        velocity.x, velocity.y, velocity.z);
 
     if (speed > hover_velocity_tolerance_) {
         hover_stable_since_.reset();
@@ -1135,7 +1370,8 @@ void MotionExecutor::updateHoverObservation(
         position.y - hover_anchor_position_.y,
         position.z - hover_anchor_position_.z);
 
-    if (displacement > hover_position_tolerance_ ||
+    if (
+        displacement > hover_position_tolerance_ ||
         yawDistance(yaw, hover_anchor_yaw_) >
             hover_yaw_tolerance_) {
         hover_stable_since_ = time;
