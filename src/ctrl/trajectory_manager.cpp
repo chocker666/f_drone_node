@@ -3,91 +3,57 @@
 
 #include <chrono>
 #include <stdexcept>
-#include <type_traits>
 #include <utility>
-#include <variant>
 
 namespace drone_node
 {
 
-TrajectoryManager::AcceptResult TrajectoryManager::accept(
-    const ControlTrajectory& msg,
-    SteadyTime now,
-    std::string& reason)
+TrajectoryManager::PreparedTrajectory
+TrajectoryManager::prepare(
+    const ControlTrajectory& msg) const
 {
-    reason.clear();
-
-    // Validate only the outer trajectory frame.
-    // Keep the existing "map" frame convention.
+    // The configured CTRL frame is currently "map".
+    // This must be consistent with the ENU feedback frame.
     if (msg.frame_id != "map") {
-        reason = "unsupported frame_id";
-        return AcceptResult::REJECTED;
+        throw std::invalid_argument(
+            "TrajectoryManager: unsupported frame_id");
     }
 
-    // Sampler replacement must not throw during move.
-    // This guarantees that a rejected trajectory does not
-    // destroy the currently active trajectory.
-    static_assert(
-        std::is_nothrow_move_constructible_v<Sampler>,
-        "Sampler must be nothrow move constructible");
+    // PolynomialSampler performs detailed trajectory validation:
+    // segment count, array sizes, finite coefficients,
+    // durations and boundary continuity.
+    auto candidate = std::make_unique<const Sampler>(msg);
 
-    try {
-        // Construct and validate the new sampler locally.
-        // The active sampler remains unchanged at this stage.
-        Sampler candidate = [&]() -> Sampler {
-            switch (msg.trajectory_type) {
+    return PreparedTrajectory{
+        msg.trajectory_id,
+        std::move(candidate)
+    };
+}
 
-            case ControlTrajectory::DISCRETE:
-                return Sampler{
-                    std::in_place_type<
-                        trajectory_sampler::DiscreteSampler>,
-                    msg.discrete_traj
-                };
-
-            case ControlTrajectory::PIECEWISE_POLYNOMIAL:
-                return Sampler{
-                    std::in_place_type<
-                        trajectory_sampler::PolynomialSampler>,
-                    msg.polynomial_traj
-                };
-
-            default:
-                throw std::invalid_argument(
-                    "unsupported trajectory_type");
-            }
-        }();
-
-        // The candidate is now fully initialized.
-        // Replace the previous trajectory.
-        sampler_.emplace(std::move(candidate));
-
-        // trajectory_id is metadata only.
-        // No value restrictions or validity checks.
-        trajectory_id_ = msg.trajectory_id;
-
-        // New trajectory starts immediately.
-        start_time_ = now;
-
-        reason = "accepted";
-        return AcceptResult::ACCEPTED;
-
-    } catch (const std::exception& e) {
-        // Validation or construction failed.
-        // The previous trajectory remains active.
-        reason = e.what();
-        return AcceptResult::REJECTED;
-    }
+void TrajectoryManager::commit(
+    PreparedTrajectory&& prepared,
+    SteadyTime now) noexcept
+{
+    // Preconditions:
+    // - prepared.sampler is non-null.
+    // - physical controller preparation has succeeded.
+    // - FlightController serializes commit with control updates.
+    //
+    // No validation or allocation occurs here.
+    sampler_ = std::move(prepared.sampler);
+    trajectory_id_ = prepared.trajectory_id;
+    start_time_ = now;
 }
 
 bool TrajectoryManager::has_trajectory() const noexcept
 {
-    return sampler_.has_value();
+    return static_cast<bool>(sampler_);
 }
 
 bool TrajectoryManager::is_started(
     SteadyTime now) const noexcept
 {
-    return sampler_.has_value() && now >= start_time_;
+    return has_trajectory() && now >= start_time_;
 }
 
 double TrajectoryManager::elapsed(
@@ -95,12 +61,12 @@ double TrajectoryManager::elapsed(
 {
     if (!sampler_) {
         throw std::logic_error(
-            "No active trajectory");
+            "TrajectoryManager: no active trajectory");
     }
 
     if (now < start_time_) {
         throw std::invalid_argument(
-            "Sample time precedes trajectory activation");
+            "TrajectoryManager: time precedes activation");
     }
 
     return std::chrono::duration<double>(
@@ -112,16 +78,10 @@ ReferenceState TrajectoryManager::sample(
 {
     if (!sampler_) {
         throw std::logic_error(
-            "No active sampler");
+            "TrajectoryManager: no active sampler");
     }
 
-    const double t = elapsed(now);
-
-    return std::visit(
-        [t](const auto& sampler) -> ReferenceState {
-            return sampler.sample(t);
-        },
-        *sampler_);
+    return sampler_->sample(elapsed(now));
 }
 
 TrajectoryManager::SampleResult
@@ -130,37 +90,27 @@ TrajectoryManager::sample_with_validity(
 {
     if (!sampler_) {
         throw std::logic_error(
-            "No active sampler");
+            "TrajectoryManager: no active sampler");
     }
 
-    const double t = elapsed(now);
+    const auto sampled =
+        sampler_->sample_with_validity(elapsed(now));
 
-    return std::visit(
-        [t](const auto& sampler) -> SampleResult {
-            const auto sampled =
-                sampler.sample_with_validity(t);
+    SampleResult result;
+    result.state = sampled.state;
+    result.validity = sampled.validity;
 
-            SampleResult result;
-            result.state = sampled.state;
-            result.validity = sampled.validity;
-
-            return result;
-        },
-        *sampler_);
+    return result;
 }
 
 double TrajectoryManager::duration() const
 {
     if (!sampler_) {
         throw std::logic_error(
-            "No active sampler");
+            "TrajectoryManager: no active sampler");
     }
 
-    return std::visit(
-        [](const auto& sampler) -> double {
-            return sampler.duration();
-        },
-        *sampler_);
+    return sampler_->duration();
 }
 
 uint64_t TrajectoryManager::trajectory_id() const noexcept
@@ -171,10 +121,6 @@ uint64_t TrajectoryManager::trajectory_id() const noexcept
 void TrajectoryManager::clear() noexcept
 {
     sampler_.reset();
-
-    // Reset inactive metadata.
-    // This does not imply that trajectory_id == 0
-    // is invalid for an active trajectory.
     trajectory_id_ = 0;
     start_time_ = SteadyTime{};
 }
@@ -184,10 +130,9 @@ void TrajectoryManager::activate(
 {
     if (!sampler_) {
         throw std::logic_error(
-            "Cannot activate an empty trajectory");
+            "TrajectoryManager: cannot activate empty trajectory");
     }
 
-    // Reset the time origin without rebuilding the sampler.
     start_time_ = now;
 }
 
