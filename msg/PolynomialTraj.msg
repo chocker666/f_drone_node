@@ -36,15 +36,9 @@ uint32 yaw_degree
 #   segment_count * (yaw_degree + 1)
 #
 # All coefficients must be finite.
-
-# X position coefficients.
+# position coefficients.
 float64[] coeff_x
-
-# Y position coefficients.
 float64[] coeff_y
-
-# Z position coefficients.
 float64[] coeff_z
-
 # Unwrapped yaw coefficients [rad].
 float64[] coeff_yaw
