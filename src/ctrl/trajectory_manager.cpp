@@ -1,18 +1,18 @@
+
 #include "drone_node/ctrl/trajectory_manager.hpp"
 
 #include <chrono>
 #include <stdexcept>
 #include <utility>
 
-#include "drone_node/ctrl/trajectory_sampler/point_sampler.hpp"
-#include "drone_node/ctrl/trajectory_sampler/list_sampler.hpp"
+#include "drone_node/ctrl/trajectory_sampler/discrete_sampler.hpp"
+#include "drone_node/ctrl/trajectory_sampler/polynomial_sampler.hpp"
 
 namespace drone_node
 {
 
-TrajectoryManager::AcceptResult TrajectoryManager::accept(
-    const ControlTrajectory& msg,
-    SteadyTime now,
+TrajectoryManager::AcceptResult TrajectoryManager::prepare(
+    const DiscreteTraj& msg,
     std::string& reason)
 {
     reason.clear();
@@ -22,58 +22,91 @@ TrajectoryManager::AcceptResult TrajectoryManager::accept(
         return AcceptResult::REJECTED;
     }
 
-    if (msg.controller_id.empty() || msg.config_name.empty()) {
-        reason = "missing controller or configuration selection";
-        return AcceptResult::REJECTED;
-    }
-
     try {
-        std::unique_ptr<SamplerBase> candidate;
-        uint8_t direction =
-            drone_node::msg::FixedTrajectory::SHORTEST;
+        // Construction performs validation and preprocessing.
+        auto candidate =
+            std::make_unique<trajectory_sampler::DiscreteSampler>(
+                msg);
 
-        switch (msg.trajectory_type) {
-        case ControlTrajectory::POINT:
-            candidate =
-                std::make_unique<trajectory_sampler::PointSampler>(
-                    msg.point_params);
-            direction = msg.point_params.yaw_direction;
-            break;
-
-        case ControlTrajectory::LIST:
-            candidate =
-                std::make_unique<trajectory_sampler::ListSampler>(
-                    msg.list_params);
-
-            // ListSampler rejects an empty list before this access.
-            direction =
-                msg.list_params.points.front().yaw_direction;
-            break;
-
-        case ControlTrajectory::PARAMETRIC:
-            reason = "PARAMETRIC sampling is reserved";
-            return AcceptResult::REJECTED;
-
-        default:
-            reason = "unsupported trajectory_type";
-            return AcceptResult::REJECTED;
-        }
+        // Update the prepared slot only after successful
+        // construction. The active trajectory is unchanged.
+        prepared_sampler_ = std::move(candidate);
+        prepared_kind_ = SamplerKind::DISCRETE;
+        prepared_trajectory_id_ = msg.trajectory_id;
 
         reason = "accepted";
-
-        // Validation and sampler construction have completed.
-        // Commit immediately; no cross-trajectory blending.
-        sampler_ = std::move(candidate);
-        yaw_direction_ = direction;
-        start_time_ = now;
-        trajectory_id_ = msg.trajectory_id;
-        has_trajectory_ = true;
-
         return AcceptResult::ACCEPTED;
     } catch (const std::exception& e) {
         reason = e.what();
         return AcceptResult::REJECTED;
     }
+}
+
+TrajectoryManager::AcceptResult TrajectoryManager::prepare(
+    const PolynomialTraj& msg,
+    std::string& reason)
+{
+    reason.clear();
+
+    if (msg.frame_id != "map") {
+        reason = "unsupported frame_id";
+        return AcceptResult::REJECTED;
+    }
+
+    try {
+        // Construction validates coefficients, durations
+        // and inter-segment continuity.
+        auto candidate =
+            std::make_unique<trajectory_sampler::PolynomialSampler>(
+                msg);
+
+        // Do not replace the active sampler yet.
+        prepared_sampler_ = std::move(candidate);
+        prepared_kind_ = SamplerKind::POLYNOMIAL;
+        prepared_trajectory_id_ = msg.trajectory_id;
+
+        reason = "accepted";
+        return AcceptResult::ACCEPTED;
+    } catch (const std::exception& e) {
+        reason = e.what();
+        return AcceptResult::REJECTED;
+    }
+}
+
+bool TrajectoryManager::commit(SteadyTime now) noexcept
+{
+    if (!prepared_sampler_) {
+        return false;
+    }
+
+    // No validation or sampler construction occurs here.
+    // Transfer ownership of the prepared sampler.
+    sampler_ = std::move(prepared_sampler_);
+
+    sampler_kind_ = prepared_kind_;
+    trajectory_id_ = prepared_trajectory_id_;
+
+    start_time_ = now;
+    has_trajectory_ = true;
+
+    // Reset prepared metadata after the transfer.
+    prepared_kind_ = SamplerKind::NONE;
+    prepared_trajectory_id_ = 0;
+
+    return true;
+}
+
+void TrajectoryManager::discard_prepared() noexcept
+{
+    prepared_sampler_.reset();
+
+    prepared_kind_ = SamplerKind::NONE;
+    prepared_trajectory_id_ = 0;
+}
+
+bool TrajectoryManager::has_prepared() const noexcept
+{
+    return prepared_sampler_ != nullptr;
 }
 
 bool TrajectoryManager::has_trajectory() const noexcept
@@ -101,13 +134,64 @@ double TrajectoryManager::elapsed(SteadyTime now) const
         now - start_time_).count();
 }
 
-ReferenceState TrajectoryManager::sample(SteadyTime now) const
+ReferenceState TrajectoryManager::sample(
+    SteadyTime now) const
 {
     if (!has_trajectory_ || !sampler_) {
         throw std::logic_error("No active sampler");
     }
 
     return sampler_->sample(elapsed(now));
+}
+
+TrajectoryManager::SampleResult
+TrajectoryManager::sample_with_validity(
+    SteadyTime now) const
+{
+    if (!has_trajectory_ || !sampler_) {
+        throw std::logic_error("No active sampler");
+    }
+
+    const double t = elapsed(now);
+
+    SampleResult result;
+
+    switch (sampler_kind_) {
+    case SamplerKind::DISCRETE: {
+        const auto* discrete =
+            static_cast<
+                const trajectory_sampler::DiscreteSampler*>(
+                    sampler_.get());
+
+        const auto sampled =
+            discrete->sample_with_validity(t);
+
+        result.state = sampled.state;
+        result.validity = sampled.validity;
+
+        return result;
+    }
+
+    case SamplerKind::POLYNOMIAL: {
+        const auto* polynomial =
+            static_cast<
+                const trajectory_sampler::PolynomialSampler*>(
+                    sampler_.get());
+
+        const auto sampled =
+            polynomial->sample_with_validity(t);
+
+        result.state = sampled.state;
+        result.validity = sampled.validity;
+
+        return result;
+    }
+
+    case SamplerKind::NONE:
+    default:
+        throw std::logic_error(
+            "Unknown active sampler type");
+    }
 }
 
 double TrajectoryManager::duration() const
@@ -124,18 +208,18 @@ uint64_t TrajectoryManager::trajectory_id() const noexcept
     return trajectory_id_;
 }
 
-uint8_t TrajectoryManager::yaw_direction() const noexcept
-{
-    return yaw_direction_;
-}
-
 void TrajectoryManager::clear() noexcept
 {
+    // Clear the active trajectory.
     sampler_.reset();
-    yaw_direction_ = drone_node::msg::FixedTrajectory::SHORTEST;
+    sampler_kind_ = SamplerKind::NONE;
+
     trajectory_id_ = 0;
     start_time_ = SteadyTime{};
     has_trajectory_ = false;
+
+    // Clear any pending candidate.
+    discard_prepared();
 }
 
 void TrajectoryManager::activate(SteadyTime now)
@@ -147,6 +231,5 @@ void TrajectoryManager::activate(SteadyTime now)
 
     start_time_ = now;
 }
-
 
 }  // namespace drone_node
