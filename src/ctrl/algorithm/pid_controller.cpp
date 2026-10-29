@@ -76,18 +76,29 @@ PIDController<N>::limit_vector(
 }
 
 template<int N>
-ControllerOutput<N> PIDController<N>::update(
-    const ControllerInput<N>& input)
+AlgorithmOutput<N> PIDController<N>::update(
+    const AlgorithmInput<N>& input)
+{
+    return update_with_feedforward(
+        input, Vector::Zero());
+}
+
+template<int N>
+AlgorithmOutput<N> PIDController<N>::update_with_feedforward(
+    const AlgorithmInput<N>& input,
+    const Vector& feedforward)
 {
     if (!std::isfinite(input.dt) ||
         input.dt <= 0.0 ||
         !input.error.allFinite() ||
-        !input.error_rate.allFinite()) {
+        !input.error_rate.allFinite() ||
+        !feedforward.allFinite()) {
         throw std::invalid_argument(
-            "Invalid PID input");
+            "Invalid PID input or feedforward");
     }
 
     const Vector previous_unsaturated =
+        feedforward +
         parameters_.kp * input.error +
         parameters_.ki * integral_error_ +
         parameters_.kd * input.error_rate;
@@ -125,6 +136,7 @@ ControllerOutput<N> PIDController<N>::update(
     }
 
     const Vector raw_command =
+        feedforward +
         parameters_.kp * input.error +
         parameters_.ki * integral_error_ +
         parameters_.kd * input.error_rate;
@@ -145,7 +157,7 @@ ControllerOutput<N> PIDController<N>::update(
 
     previous_command_ = command;
 
-    ControllerOutput<N> output;
+    AlgorithmOutput<N> output;
     output.command = command;
     return output;
 }

@@ -36,6 +36,16 @@ struct ReferenceValidity
     bool yaw_rate{false};
 };
 
+// Unified trajectory sampling result.
+// Contains the sampled reference state and its validity flags.
+// A valid flag indicates that the corresponding reference
+// quantity is available for physical controller consumption.
+struct ReferenceSample
+{
+    ReferenceState state{};
+    ReferenceValidity validity{};
+};
+
 struct FeedbackValidity
 {
     bool valid{false};

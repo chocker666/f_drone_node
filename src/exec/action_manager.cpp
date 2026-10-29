@@ -11,9 +11,9 @@
 namespace drone_node::exec
 {
 
-// ============================================================
-// Construction
-// ============================================================
+
+
+
 
 ActionManager::ActionManager(
     rclcpp::Node& node,
@@ -224,13 +224,13 @@ ActionManager::~ActionManager()
         clearPendingRequest();
     }
     catch (...) {
-        // 析构期间不抛出异常。
+
     }
 }
 
-// ============================================================
-// Action server routing
-// ============================================================
+
+
+
 
 template<typename ActionT>
 typename rclcpp_action::Server<ActionT>::SharedPtr
@@ -343,9 +343,9 @@ ActionManager::createServer(const std::string& name)
         }, rcl_action_server_get_default_options(), action_group_);
 }
 
-// ============================================================
-// Goal admission
-// ============================================================
+
+
+
 
 rclcpp_action::GoalResponse ActionManager::handleArmGoal(
     const GoalUUID& uuid,
@@ -508,7 +508,7 @@ rclcpp_action::GoalResponse ActionManager::handleLandGoal(
     if (active_ || motion_ || stop_)
         return rclcpp_action::GoalResponse::REJECT;
 
-    // 保留 action 字段兼容性，但本版不控制下降速度。
+
     if (!std::isfinite(goal.descent_speed) ||
         goal.descent_speed < 0.0) {
         RCLCPP_WARN(
@@ -554,8 +554,8 @@ rclcpp_action::GoalResponse ActionManager::handleStopGoal(
 {
     refreshSnapshot();
 
-    // Stop 不撤销已发送或正在准备发送的 Arm/Disarm 服务。
-    // Land 的内部 Disarm 阶段同样占用 active_。
+
+
     if (active_ || stop_)
         return rclcpp_action::GoalResponse::REJECT;
 
@@ -624,7 +624,7 @@ rclcpp_action::GoalResponse ActionManager::handleContinueGoal(
 
     motion_.emplace(std::move(operation));
 
-    // 接纳后消费暂停槽；失败和取消均不恢复旧槽。
+
     paused_.reset();
 
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -672,9 +672,9 @@ rclcpp_action::GoalResponse ActionManager::handleHoverGoal(
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
 }
 
-// ============================================================
-// Cancel admission
-// ============================================================
+
+
+
 
 rclcpp_action::CancelResponse ActionManager::handleArmCancel(
     const GoalUUID& uuid)
@@ -701,7 +701,7 @@ rclcpp_action::CancelResponse ActionManager::handleMotionCancel(
         return rclcpp_action::CancelResponse::REJECT;
 
     if (motion_->landing_disarm) {
-        // 服务发送后无法撤回，不接纳取消。
+
         if (!active_ || active_->request_sent)
             return rclcpp_action::CancelResponse::REJECT;
 
@@ -715,7 +715,7 @@ rclcpp_action::CancelResponse ActionManager::handleMotionCancel(
     motion_->cancel_requested = true;
     paused_.reset();
 
-    // 已有 Stop 时，客户端明确放弃优先于保存暂停任务。
+
     if (stop_ && motion_->trajectory_id) {
         motion_executor_->requestStop(
             *motion_->trajectory_id,
@@ -734,16 +734,16 @@ rclcpp_action::CancelResponse ActionManager::handleStopCancel(
         return rclcpp_action::CancelResponse::REJECT;
     }
 
-    // 取消 Stop 不恢复原运动，仍继续完成安全停止。
+
     stop_->cancel_requested = true;
     paused_.reset();
 
     return rclcpp_action::CancelResponse::ACCEPT;
 }
 
-// ============================================================
-// GoalHandle adapters
-// ============================================================
+
+
+
 
 template<typename ActionT>
 void ActionManager::attachArmGoal(
@@ -953,9 +953,9 @@ void ActionManager::attachStopGoal(
     stop_->attached = true;
 }
 
-// ============================================================
-// Observation and execution events
-// ============================================================
+
+
+
 
 void ActionManager::enqueueExecutionEvent(
     const MotionExecutor::ExecutionEvent& event)
@@ -1071,20 +1071,20 @@ void ActionManager::handleResetFault(
 
     response->success = false;
 
-    // 1. 必须已经处于 FAULT。
+
     if (fsm_->phase() != FlightPhase::FAULT) {
         response->message = "Exec is not in FAULT";
         return;
     }
 
-    // 2. 不允许有尚未结束的 Action 事务。
+
     if (active_ || motion_ || stop_) {
         response->message =
             "Cannot reset: an Action operation is still active";
         return;
     }
 
-    // 3. 不允许存在尚未处理的执行事件。
+
     {
         std::lock_guard<std::mutex> lock(event_mutex_);
 
@@ -1095,19 +1095,19 @@ void ActionManager::handleResetFault(
         }
     }
 
-    // 4. 获取 MotionExecutor 的最新真实观测。
+
     refreshSnapshot();
 
     const auto snapshot = fsm_->snapshot();
 
-    // 5. 必须确认 PX4 已连接。
+
     if (!snapshot.connected_valid || !snapshot.connected) {
         response->message =
             "Cannot reset: PX4 connection is unavailable";
         return;
     }
 
-    // 6. 第一版只允许已锁定、已落地的情况。
+
     if (!snapshot.armed_valid || snapshot.armed) {
         response->message =
             "Cannot reset: vehicle must be disarmed";
@@ -1120,7 +1120,7 @@ void ActionManager::handleResetFault(
         return;
     }
 
-    // 7. Ctrl 必须已经停止轨迹执行，且没有故障。
+
     if (!snapshot.control_status_valid ||
         !snapshot.control_available ||
         snapshot.control_fault ||
@@ -1131,8 +1131,8 @@ void ActionManager::handleResetFault(
         return;
     }
 
-    // 8. 调用 FSM 已有的显式恢复事件。
-    // FSM 会再次检查快照新鲜度及控制条件。
+
+
     const auto result =
         fsm_->process_event(FlightEvent::STATE_RECOVERED);
 
@@ -1148,9 +1148,9 @@ void ActionManager::handleResetFault(
         return;
     }
 
-    // 9. 清除失效的暂停任务。
-    // 不调用 MotionExecutor 的运动命令，
-    // 不改变 PX4 Arm 状态。
+
+
+
     paused_.reset();
 
     response->success = true;
@@ -1164,9 +1164,9 @@ void ActionManager::handleResetFault(
         to_string(result.current));
 }
 
-// ============================================================
-// Terminal delivery
-// ============================================================
+
+
+
 
 void ActionManager::clearPendingRequest()
 {
@@ -1279,9 +1279,9 @@ void ActionManager::finishStop(
         text.c_str());
 }
 
-// ============================================================
-// Manager tick
-// ============================================================
+
+
+
 
 void ActionManager::tick()
 {
@@ -1323,7 +1323,7 @@ void ActionManager::tick()
                     return;
                 }
 
-                // 已接纳的取消优先处理，避免取消后再报告成功。
+
                 if (active_->cancel_requested) {
                     tickArm();
                     return;
@@ -1331,8 +1331,8 @@ void ActionManager::tick()
 
                 const auto observation = fsm_->snapshot();
 
-                // PX4 可能已在落地后自动 Disarm。
-                // 尚未发送服务时，使用当前真实状态完成内部步骤。
+
+
                 if (!active_->request_sent &&
                     observation.armed_valid &&
                     !observation.armed &&
@@ -1400,7 +1400,7 @@ void ActionManager::tick()
                         MotionExecutor::StopReason::CLIENT_CANCEL);
                 }
                 catch (...) {
-                    // 不宣称已经安全停止。
+
                 }
             }
 
@@ -1438,9 +1438,9 @@ void ActionManager::tick()
     }
 }
 
-// ============================================================
-// Pause capture
-// ============================================================
+
+
+
 
 
 std::optional<ActionManager::PausedTask>
@@ -1468,13 +1468,13 @@ ActionManager::capturePausedTask() const
     saved.hover_remaining =
         motion_->hover_duration;
 
-    // 保存规划请求，而不是保存已生成的多项式轨迹。
-    //
-    // PlanningRequest 保留绝对目标、Yaw 方向、
-    // 控制器配置和规划约束。
-    //
-    // Continue 时 startMotion() 会根据最新反馈
-    // 重新设置起点并生成新的 ControlTrajectory。
+
+
+
+
+
+
+
     saved.request = motion_->request;
     saved.request.planner_type = PlannerType::QUINTIC;
 
@@ -1506,16 +1506,16 @@ ActionManager::capturePausedTask() const
         }
     }
 
-    // 已经发送轨迹的任务，其 motion_->request
-    // 在 startMotion() 中保存了实际规划目标。
-    //
-    // 不再从 motion_->motion（ControlTrajectory）
-    // 读取 target_position、target_yaw 或 yaw_direction。
+
+
+
+
+
     if (motion_->trajectory_id)
         return saved;
 
-    // 尚未发送轨迹的任务：
-    // 对 TAKEOFF、LAND、HOVER 计算并冻结绝对目标。
+
+
     const auto raw = motion_executor_->getStateSnapshot();
     const auto now = Clock::now();
 
@@ -1576,4 +1576,4 @@ ActionManager::capturePausedTask() const
     return saved;
 }
 
-}  // namespace drone_node::exec
+}

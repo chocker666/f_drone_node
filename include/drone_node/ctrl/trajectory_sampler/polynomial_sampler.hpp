@@ -6,30 +6,21 @@
 
 #include "drone_node/types.hpp"
 #include "drone_node/msg/control_trajectory.hpp"
-#include "drone_node/ctrl/trajectory_sampler/trajectory_sampler_base.hpp"
 
 namespace drone_node::trajectory_sampler
 {
 
-class PolynomialSampler final : public TrajectorySamplerBase
+class PolynomialSampler final
 {
 public:
-    struct SampleResult
-    {
-        ReferenceState state{};
-        ReferenceValidity validity{};
-    };
-
     explicit PolynomialSampler(
         const drone_node::msg::ControlTrajectory& trajectory);
 
-    ~PolynomialSampler() override = default;
+    ReferenceState sample(double t) const;
 
-    ReferenceState sample(double t) const override;
+    ReferenceSample sample_with_validity(double t) const;
 
-    SampleResult sample_with_validity(double t) const;
-
-    double duration() const override;
+    double duration() const;
 
 private:
     struct Segment

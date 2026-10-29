@@ -19,18 +19,6 @@ public:
     using ControlTrajectory = drone_node::msg::ControlTrajectory;
     using Sampler = trajectory_sampler::PolynomialSampler;
 
-    enum class AcceptResult
-    {
-        ACCEPTED,
-        REJECTED
-    };
-
-    struct SampleResult
-    {
-        ReferenceState state{};
-        ReferenceValidity validity{};
-    };
-
     // Fully validated candidate trajectory.
     // Does not affect the currently active trajectory.
     struct PreparedTrajectory
@@ -67,13 +55,9 @@ public:
 
     bool has_trajectory() const noexcept;
 
-    bool is_started(SteadyTime now) const noexcept;
-
     double elapsed(SteadyTime now) const;
 
-    ReferenceState sample(SteadyTime now) const;
-
-    SampleResult sample_with_validity(
+    ReferenceSample sample_with_validity(
         SteadyTime now) const;
 
     double duration() const;
@@ -81,8 +65,6 @@ public:
     uint64_t trajectory_id() const noexcept;
 
     void clear() noexcept;
-
-    void activate(SteadyTime now);
 
 private:
     std::unique_ptr<const Sampler> sampler_;

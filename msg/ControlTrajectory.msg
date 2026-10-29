@@ -25,7 +25,9 @@
 #   the vehicle has reached the target state.
 
 # Trajectory identifier.
-# All uint64 values, including 0, are valid.
+# Must be non-zero.
+# ID 0 is reserved internally to represent no active trajectory.
+# Non-zero IDs do not need to be monotonically increasing.
 uint64 trajectory_id
 
 # Coordinate frame identifier.

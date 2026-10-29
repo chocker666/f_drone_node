@@ -286,8 +286,7 @@ ReferenceState PolynomialSampler::sample(double t) const
     return sample_with_validity(t).state;
 }
 
-PolynomialSampler::SampleResult
-PolynomialSampler::sample_with_validity(double t) const
+ReferenceSample PolynomialSampler::sample_with_validity(double t) const
 {
     if (!finite(t) || t < 0.0) {
         throw std::invalid_argument(
@@ -299,7 +298,7 @@ PolynomialSampler::sample_with_validity(double t) const
             "PolynomialSampler: no trajectory segments");
     }
 
-    SampleResult result;
+    ReferenceSample result;
 
     result.validity.position = true;
     result.validity.velocity = true;
@@ -307,7 +306,9 @@ PolynomialSampler::sample_with_validity(double t) const
     result.validity.yaw = true;
     result.validity.yaw_rate = true;
 
-    // Match the existing CTRL endpoint-hold convention.
+    // After the trajectory ends, hold the terminal position
+    // and yaw while setting velocity, acceleration and yaw
+    // rate references to zero.
     if (t >= duration_) {
         const Segment& last = segments_.back();
         const double end_time = last.duration;

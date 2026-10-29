@@ -1,7 +1,7 @@
 
 #pragma once
 
-#include "drone_node/ctrl/algorithm/controller_base.hpp"
+#include "drone_node/ctrl/algorithm/algorithm_base.hpp"
 
 namespace drone_node::algorithm
 {
@@ -26,10 +26,10 @@ struct PIDParameters
 };
 
 template<int N>
-class PIDController final : public ControllerBase<N>
+class PIDController final : public AlgorithmBase<N>
 {
 public:
-    using Vector = ControlVector<N>;
+    using Vector = AlgorithmVector<N>;
 
     explicit PIDController(
         const PIDParameters& parameters = PIDParameters{});
@@ -41,8 +41,12 @@ public:
 
     void reset() override;
 
-    ControllerOutput<N> update(
-        const ControllerInput<N>& input) override;
+    AlgorithmOutput<N> update(
+        const AlgorithmInput<N>& input) override;
+
+    AlgorithmOutput<N> update_with_feedforward(
+        const AlgorithmInput<N>& input,
+        const Vector& feedforward);
 
 private:
     Vector limit_vector(

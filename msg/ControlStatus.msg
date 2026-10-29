@@ -2,7 +2,9 @@
 
 builtin_interfaces/Time stamp
 
-# Active trajectory ID. Zero means no active trajectory.
+# Active trajectory ID.
+# 0 indicates that CTRL is not tracking an active trajectory.
+# During TRACKING, this field must be non-zero.
 uint64 trajectory_id
 
 uint8 IDLE=0

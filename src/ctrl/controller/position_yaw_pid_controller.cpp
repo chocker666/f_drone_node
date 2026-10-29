@@ -163,8 +163,9 @@ ControllerResult PositionYawPIDController::update(
         input.reference.velocity - input.state.velocity;
     position_input.dt = input.dt;
 
-    // POINT keeps the original fixed target exactly.
-    // A continuous reference may advance within the active trajectory.
+    // Preserve the initial continuous yaw alignment.
+    // Subsequent polynomial yaw references are applied relative
+    // to the initial reference without introducing angle wrapping.
     const double target_yaw =
         initial_target_yaw_ +
         (input.reference.yaw - initial_reference_yaw_);
@@ -188,8 +189,13 @@ ControllerResult PositionYawPIDController::update(
             "PositionYawPIDController: non-finite tracking error");
     }
 
-    const auto position_output = position_pid_.update(position_input);
-    const auto yaw_output = yaw_pid_.update(yaw_input);
+    const auto position_output =
+        position_pid_.update_with_feedforward(
+            position_input,
+            input.reference.velocity);
+
+    const auto yaw_output =
+        yaw_pid_.update(yaw_input);
 
     if (!position_output.command.allFinite() ||
         !yaw_output.command.allFinite()) {

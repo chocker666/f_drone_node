@@ -37,13 +37,14 @@ public:
     // The configured parameters remain unchanged.
     virtual void reset() = 0;
 
-    // Initialize a newly activated reference from the state snapshot.
-    // Position/yaw controllers use direction to select the initial
-    // continuous yaw target.
+    // Initialize the controller from the current state and
+    // the initial reference of a newly activated trajectory.
+    // Position/yaw controllers use direction to select the
+    // initial continuous yaw target.
     //
-    // The caller invokes this after reset and before the first update.
-    // Subsequent reference yaw values must remain continuous within
-    // the active trajectory.
+    // Implementations manage their own reset during initialization.
+    // When the active controller is reused for a new trajectory,
+    // initialization may be skipped to preserve controller history.
     //
     // Throws on unsupported or invalid initialization input.
     virtual void initialize(

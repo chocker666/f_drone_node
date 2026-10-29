@@ -12,8 +12,15 @@ TrajectoryManager::PreparedTrajectory
 TrajectoryManager::prepare(
     const ControlTrajectory& msg) const
 {
-    // The configured CTRL frame is currently "map".
-    // This must be consistent with the ENU feedback frame.
+    if (msg.trajectory_id == 0) {
+        throw std::invalid_argument(
+            "TrajectoryManager: trajectory_id must be non-zero");
+    }
+
+    // CTRL currently accepts only the "map" frame.
+    // Trajectory coordinates must be expressed in the
+    // same local ENU frame as the vehicle state feedback.
+    // No coordinate transformation is performed here.
     if (msg.frame_id != "map") {
         throw std::invalid_argument(
             "TrajectoryManager: unsupported frame_id");
@@ -39,6 +46,8 @@ void TrajectoryManager::commit(
     // - physical controller preparation has succeeded.
     // - FlightController serializes commit with control updates.
     //
+    // Commit the prepared sampler, trajectory ID and start time.
+    // Physical controller switching is handled by FlightController.
     // No validation or allocation occurs here.
     sampler_ = std::move(prepared.sampler);
     trajectory_id_ = prepared.trajectory_id;
@@ -48,12 +57,6 @@ void TrajectoryManager::commit(
 bool TrajectoryManager::has_trajectory() const noexcept
 {
     return static_cast<bool>(sampler_);
-}
-
-bool TrajectoryManager::is_started(
-    SteadyTime now) const noexcept
-{
-    return has_trajectory() && now >= start_time_;
 }
 
 double TrajectoryManager::elapsed(
@@ -73,18 +76,7 @@ double TrajectoryManager::elapsed(
         now - start_time_).count();
 }
 
-ReferenceState TrajectoryManager::sample(
-    SteadyTime now) const
-{
-    if (!sampler_) {
-        throw std::logic_error(
-            "TrajectoryManager: no active sampler");
-    }
-
-    return sampler_->sample(elapsed(now));
-}
-
-TrajectoryManager::SampleResult
+ReferenceSample
 TrajectoryManager::sample_with_validity(
     SteadyTime now) const
 {
@@ -93,14 +85,7 @@ TrajectoryManager::sample_with_validity(
             "TrajectoryManager: no active sampler");
     }
 
-    const auto sampled =
-        sampler_->sample_with_validity(elapsed(now));
-
-    SampleResult result;
-    result.state = sampled.state;
-    result.validity = sampled.validity;
-
-    return result;
+    return sampler_->sample_with_validity(elapsed(now));
 }
 
 double TrajectoryManager::duration() const
@@ -123,17 +108,6 @@ void TrajectoryManager::clear() noexcept
     sampler_.reset();
     trajectory_id_ = 0;
     start_time_ = SteadyTime{};
-}
-
-void TrajectoryManager::activate(
-    SteadyTime now)
-{
-    if (!sampler_) {
-        throw std::logic_error(
-            "TrajectoryManager: cannot activate empty trajectory");
-    }
-
-    start_time_ = now;
 }
 
 }  // namespace drone_node
