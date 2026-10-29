@@ -23,7 +23,7 @@ constexpr double ACCELERATION_TOL = 1e-3;
 constexpr double YAW_TOL = 1e-5;
 constexpr double YAW_RATE_TOL = 1e-4;
 
-constexpr std::size_t MAX_DEGREE = 32;
+constexpr std::size_t COEFFICIENT_COUNT = 6;
 
 bool finite(double value)
 {
@@ -60,37 +60,34 @@ void validate_coefficients(
 
 }  // namespace
 
+
 PolynomialSampler::PolynomialSampler(
-    const drone_node::msg::PolynomialTraj& trajectory)
+    const drone_node::msg::ControlTrajectory& trajectory)
 {
     const std::size_t count =
         static_cast<std::size_t>(trajectory.segment_count);
-
-    const std::size_t position_degree =
-        static_cast<std::size_t>(trajectory.position_degree);
-
-    const std::size_t yaw_degree =
-        static_cast<std::size_t>(trajectory.yaw_degree);
 
     if (count == 0) {
         throw std::invalid_argument(
             "PolynomialSampler: segment_count must be positive");
     }
 
-    if (position_degree > MAX_DEGREE ||
-        yaw_degree > MAX_DEGREE) {
+    // Prevent size multiplication overflow.
+    if (count >
+        std::numeric_limits<std::size_t>::max() /
+            COEFFICIENT_COUNT) {
         throw std::invalid_argument(
-            "PolynomialSampler: polynomial degree exceeds limit");
+            "PolynomialSampler: segment count overflow");
     }
 
-    const std::size_t position_stride = position_degree + 1;
-    const std::size_t yaw_stride = yaw_degree + 1;
+    const std::size_t expected_coefficients =
+        count * COEFFICIENT_COUNT;
 
     if (trajectory.segment_duration.size() != count ||
-        trajectory.coeff_x.size() != count * position_stride ||
-        trajectory.coeff_y.size() != count * position_stride ||
-        trajectory.coeff_z.size() != count * position_stride ||
-        trajectory.coeff_yaw.size() != count * yaw_stride) {
+        trajectory.coeff_x.size() != expected_coefficients ||
+        trajectory.coeff_y.size() != expected_coefficients ||
+        trajectory.coeff_z.size() != expected_coefficients ||
+        trajectory.coeff_yaw.size() != expected_coefficients) {
         throw std::invalid_argument(
             "PolynomialSampler: inconsistent array lengths");
     }
@@ -118,28 +115,28 @@ PolynomialSampler::PolynomialSampler(
         segment.start_time = elapsed;
         segment.duration = segment_duration;
 
-        const std::size_t p_offset = i * position_stride;
-        const std::size_t y_offset = i * yaw_stride;
+        const std::size_t offset =
+            i * COEFFICIENT_COUNT;
 
         segment.coeff_x.assign(
-            trajectory.coeff_x.begin() + p_offset,
+            trajectory.coeff_x.begin() + offset,
             trajectory.coeff_x.begin() +
-                p_offset + position_stride);
+                offset + COEFFICIENT_COUNT);
 
         segment.coeff_y.assign(
-            trajectory.coeff_y.begin() + p_offset,
+            trajectory.coeff_y.begin() + offset,
             trajectory.coeff_y.begin() +
-                p_offset + position_stride);
+                offset + COEFFICIENT_COUNT);
 
         segment.coeff_z.assign(
-            trajectory.coeff_z.begin() + p_offset,
+            trajectory.coeff_z.begin() + offset,
             trajectory.coeff_z.begin() +
-                p_offset + position_stride);
+                offset + COEFFICIENT_COUNT);
 
         segment.coeff_yaw.assign(
-            trajectory.coeff_yaw.begin() + y_offset,
+            trajectory.coeff_yaw.begin() + offset,
             trajectory.coeff_yaw.begin() +
-                y_offset + yaw_stride);
+                offset + COEFFICIENT_COUNT);
 
         const double next_elapsed =
             elapsed + segment_duration;
@@ -151,6 +148,24 @@ PolynomialSampler::PolynomialSampler(
                 "or insufficient time resolution");
         }
 
+        // Validate finite position, velocity and acceleration
+        // at both ends of each segment.
+        const auto validate_endpoint =
+            [&](const std::vector<double>& coefficients,
+                unsigned int max_derivative) {
+                for (double t : {0.0, segment_duration}) {
+                    for (unsigned int d = 0;
+                         d <= max_derivative; ++d) {
+                        (void)evaluate(coefficients, t, d);
+                    }
+                }
+            };
+
+        validate_endpoint(segment.coeff_x, 2);
+        validate_endpoint(segment.coeff_y, 2);
+        validate_endpoint(segment.coeff_z, 2);
+        validate_endpoint(segment.coeff_yaw, 1);
+
         if (!segments_.empty()) {
             validate_boundary(segments_.back(), segment);
         }
@@ -161,6 +176,7 @@ PolynomialSampler::PolynomialSampler(
 
     duration_ = elapsed;
 }
+
 
 double PolynomialSampler::evaluate(
     const std::vector<double>& coefficients,
